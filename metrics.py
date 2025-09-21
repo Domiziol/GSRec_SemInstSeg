@@ -50,7 +50,7 @@ def evaluate(model_paths):
             full_dict_polytopeonly[scene_dir] = {}
             per_view_dict_polytopeonly[scene_dir] = {}
 
-            test_dir = Path(scene_dir) / "test"
+            test_dir = Path(scene_dir) / "train" # for gsurf - train, for gsrec - test
 
             for method in os.listdir(test_dir):
                 print("Method:", method)

@@ -10,6 +10,7 @@
 #
 import os
 from functools import reduce
+from typing import List
 import numpy as np
 import torch
 from plyfile import PlyData, PlyElement
@@ -249,6 +250,7 @@ class GaussianModel:
         
         
     def __init__(self, 
+                 classes : List[str],   # semantic
                  feat_dim: int=32, 
                  n_offsets: int=10, 
                  voxel_size: float=0.01,
@@ -257,8 +259,13 @@ class GaussianModel:
                  update_hierachy_factor: int=4,
                  divide_factor: float=1.0,
                  sdf_inside_out: bool=True,
-                 use_feat_bank = False):
+                 use_feat_bank = False,
+                 ):
 
+        self.num_classes = len(classes)  # semantic
+        self.class_names = classes  # semantic
+        self._sem_logits = torch.empty(0) # semantic [N,K] learnable per-anchor class logits
+        self.denom = None
         self.feat_dim = feat_dim
         self.n_offsets = n_offsets
         self.voxel_size = voxel_size
@@ -374,8 +381,10 @@ class GaussianModel:
             self._opacity,
             self.max_radii2D,
             self.denom,
+            self._sem_logits,       # semantic
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+
         )
     
     def restore(self, model_args, training_args):
@@ -388,12 +397,32 @@ class GaussianModel:
         self._opacity,
         self.max_radii2D, 
         denom,
+        self._sem_logits,       # semantic
         opt_dict, 
         self.spatial_lr_scale) = model_args
         self.training_setup(training_args)
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
+        self._ensure_sem_logits()
 
+    def _ensure_sem_logits(self):
+        N = self.get_anchor.shape[0]          # or self._anchor.shape[0]
+        K = getattr(self, "num_classes", 0)
+        if K <= 0:
+            raise ValueError("num_classes is 0; pass a non-empty `classes` list to GaussianModel(...)")
+
+        need_init = (
+            not hasattr(self, "_sem_logits")
+            or self._sem_logits is None
+            or self._sem_logits.ndim != 2
+            or self._sem_logits.shape[0] != N
+            or self._sem_logits.shape[1] != K
+        )
+        if need_init:
+            device = self._anchor.device
+            self._sem_logits = torch.nn.Parameter(
+                torch.zeros((N, K), dtype=torch.float32, device=device)
+            )
 
     @property
     def get_scaling(self):
@@ -461,6 +490,14 @@ class GaussianModel:
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
     
+    # semantic
+    def get_sem_probs(self):
+        
+        #   Returns per-anchor class probabilities, shape [N, K].
+        #   softmax(_sem_logits) along classes.
+        self._ensure_sem_logits()
+        return torch.softmax(self._sem_logits, dim=1)
+
     def voxelize_sample(self, data=None, voxel_size=0.01):
         np.random.shuffle(data)
         data = np.unique(np.round(data/voxel_size), axis=0)*voxel_size
@@ -519,6 +556,10 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(False))
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
 
+        # semantic
+        N = self.get_anchor.shape[0]
+        self._sem_logits = nn.Parameter(torch.zeros((N, self.num_classes), dtype=torch.float32, device="cuda").requires_grad_(True))
+        self._ensure_sem_logits()
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -543,7 +584,8 @@ class GaussianModel:
                 {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
                 {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
-                
+                {'params': [self._sem_logits], 'lr': getattr(training_args, 'semantic_lr', training_args.feature_lr), "name": "sem_logits"},    # semantic, same learning rate as in anchor feature
+
                 {'params': self.mlp_opacity.parameters(), 'lr': training_args.mlp_opacity_lr_init, "name": "mlp_opacity"},
                 {'params': self.mlp_feature_bank.parameters(), 'lr': training_args.mlp_featurebank_lr_init, "name": "mlp_featurebank"},
                 {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
@@ -560,6 +602,8 @@ class GaussianModel:
                 {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
                 {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
+                {'params': [self._sem_logits], 'lr': getattr(training_args, 'semantic_lr', training_args.feature_lr), "name": "sem_logits"}, # semantic
+
                 {'params': self.mlp_opacity.parameters(), 'lr': training_args.mlp_opacity_lr_init, "name": "mlp_opacity"},
                 {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
                 {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
@@ -839,6 +883,7 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
         # self._normal = optimizable_tensors["normal"]
+        self._sem_logits = optimizable_tensors["sem_logits"]    # semantic
 
     
     def anchor_growing(self, grads, threshold, offset_mask):
@@ -911,6 +956,9 @@ class GaussianModel:
                 new_offsets = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1,self.n_offsets,1]).float().cuda()
                 # new_normals = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1,self.n_offsets,1]).float().cuda()
                 new_normals = torch.nn.functional.normalize(-candidate_anchor, dim=-1).unsqueeze(dim=1).repeat([1,self.n_offsets,1]).float().cuda()
+                
+                num_new = candidate_anchor.shape[0]     # semantic
+                new_sem_logits = torch.zeros((num_new, self.num_classes), dtype=torch.float32, device='cuda')      # semantic
 
                 d = {
                     "anchor": candidate_anchor,
@@ -920,6 +968,7 @@ class GaussianModel:
                     "offset": new_offsets,
                     "opacity": new_opacities,
                     "normal": new_normals,
+                    "sem_logits": new_sem_logits,   # semantic
                 }
                 
 
@@ -941,6 +990,7 @@ class GaussianModel:
                 self._offset = optimizable_tensors["offset"]
                 # self._normal = optimizable_tensors["normal"]
                 self._opacity = optimizable_tensors["opacity"]
+                self._sem_logits = optimizable_tensors["sem_logits"]    # semantic
                 
 
 

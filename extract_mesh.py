@@ -85,13 +85,52 @@ def get_surface_trace(path, gs, resolution=100, grid_boundary=[-2.0, 2.0], retur
         return traces
     return None
 
+import colorsys
+
+def palette_from_classes(classes, s=0.65, v=0.95):
+    n = max(1, len(classes))
+    table = np.zeros((len(classes), 3), dtype=np.float32)
+    for i, _ in enumerate(classes):
+        h = i / n
+        r, g, b = colorsys.hsv_to_rgb(h, s, v)
+        table[i] = (r, g, b)
+    return table 
+
+def get_classes():
+    classes= []
+
+    with open("info_semantic.json", 'r') as classes_file:
+        data = json.load(classes_file)
+
+    for objects in data['classes']:
+        classes.append(objects['name'])
+
+    # device = "cuda" if torch.cuda.is_available() else "cpu"
+    # clip_model, clip_preprocess = clip.load("ViT-B/16", device=device)
+
+    return classes
+
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background, mesh_type="mcube"):
     if mesh_type == "poisson":        
-        points, color, opaicity,scaling,rot, normal, _, _, _,_ = generate_neural_gaussians_SDF(views[0], gaussians, visible_mask=None)        
+        points, color, opaicity,scaling,rot, normal, _, _, _,_ = generate_neural_gaussians_SDF(views[0], gaussians, visible_mask=None)
+        with torch.no_grad():
+            print("anchor:", gaussians.get_anchor.shape)
+            if hasattr(gaussians, "_sem_logits") and gaussians._sem_logits is not None:
+                print("sem_logits shape:", gaussians._sem_logits.shape)
+            else:
+                print("_sem_logits is None")
+            Pi = gaussians.get_sem_probs()              # [N_anchor, K], softmaxed
+            cls_idx = Pi.argmax(dim=1).cpu().numpy()    
         
+        anchor_xyz = gaussians.get_anchor.detach().cpu().numpy()
+        classes = get_classes()                         # same list used when you constructed GaussianModel
+        palette = palette_from_classes(classes)         # [K,3] floats in [0,1]
+        anchor_colors = palette[cls_idx] 
+        
+
         points = points.cpu().detach().numpy()
         points_normals = torch.nn.functional.normalize(normal).cpu().detach().numpy()
-        vertices, triangle, pcd = poisson_surface_reconstruction(points, points_normals, 9)
+        vertices, triangle, pcd = poisson_surface_reconstruction(points, points_normals, 8) # 9
         # vertices, triangle, pcd = poisson_surface_reconstruction(points, None, 9)
         # use open3d to save the mesh
         import open3d as o3d
@@ -108,6 +147,22 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         pcd.normals = o3d.utility.Vector3dVector(scaled_normals)
         # o3d.visualization.draw_geometries([pcd], point_show_normal=True)
         # mesh.compute_vertex_normals()
+        
+        from scipy.spatial import cKDTree
+        kdtree = cKDTree(anchor_xyz)
+        verts = np.asarray(mesh.vertices)
+        _, idx = kdtree.query(verts, k=1) 
+        v_colors = anchor_colors[idx] 
+
+
+        # n = len(mesh.vertices)
+        # colors = np.tile(np.array([1.0, 0.0, 0.0], dtype=np.float64), (n,1))
+        mesh.vertex_colors = o3d.utility.Vector3dVector(v_colors.astype(np.float64))
+        # print("verts:", len(mesh.vertices), "colors:", len(mesh.vertex_colors))
+        # Write the mesh to a file, including vertex colors
+        o3d.io.write_triangle_mesh(os.path.join(model_path, "semantic_mesh_poisson_{}".format(iteration)+ ".ply"), mesh, write_vertex_colors=True)
+
+
         o3d.io.write_triangle_mesh(os.path.join(model_path, "extracted_mesh_poisson_{}".format(iteration)+ ".ply"), mesh)        
     elif mesh_type == "mcube":
         _ = get_surface_trace(
@@ -144,13 +199,64 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     else:
         raise NotImplementedError
      
-def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, mesh_type: str):
+def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, mesh_type: str, checkpoint: str):
+    
+    
+    classes = get_classes()
     with torch.no_grad():
         dataset.eval = True
-        gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank)
+        gaussians = GaussianModel(classes,dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
-        
+        if(checkpoint):
+            ckpt = torch.load(checkpoint, map_location="cuda")
+            if isinstance(ckpt, tuple) and isinstance(ckpt[0], tuple):
+                capture = ckpt[0]
+            else:
+                raise RuntimeError("Unexpected checkpoint format; expected (capture, iteration)")
+
+            # --- OPTION A: directly grab sem logits by index (based on your printout) ---
+            sem_logits = capture[7]   # shape [N_anchor, K_classes] = (98606, 101)
+
+            # Sanity: make sure anchors count matches the scene’s anchors
+            N_ckpt = sem_logits.shape[0]
+            N_scene = gaussians._anchor.shape[0]
+            if N_ckpt != N_scene:
+                print(f"[extract_mesh] Anchor count mismatch: ckpt={N_ckpt} vs scene={N_scene}. "
+                    f"Build Scene with the SAME iteration as the checkpoint or do a full restore.")
+                # Either rebuild Scene with load_iteration=<that iteration>,
+                # or do a full model restore (see Option B below).
+
+            # Attach to the model (no need to train here, so keep it frozen)
+            gaussians._sem_logits = torch.nn.Parameter(
+                sem_logits.to(gaussians._anchor.device), requires_grad=False
+            )
+            # 
+            # print("[ckpt] type:", type(ckpt))
+
+            # if isinstance(ckpt, tuple):
+            #     print("[ckpt] tuple length:", len(ckpt))
+            #     # Training saves usually look like: (capture_tuple, iteration)
+            #     capture = ckpt[0] if len(ckpt) >= 1 else None
+            #     print("[ckpt] capture is tuple?", isinstance(capture, tuple))
+            #     if isinstance(capture, tuple):
+            #         print("[ckpt] capture length:", len(capture))
+            #         for i, it in enumerate(capture):
+            #             if torch.is_tensor(it):
+            #                 print(f"  capture[{i}] tensor shape={tuple(it.shape)} dtype={it.dtype}")
+            #             else:
+            #                 print(f"  capture[{i}] type={type(it)}")
+            # elif isinstance(ckpt, dict):
+            #     print("[ckpt] dict keys:", list(ckpt.keys())[:20])
+            # else:
+            #     print("[ckpt] unexpected object")
+            # (model_params, _) = torch.load(checkpoint)
+            # sem_logits = model_params[8]
+            # if sem_logits is None or sem_logits.numel() == 0:
+            #     print("[extract_mesh] Checkpoint has empty sem logits; continuing without trained semantics.")
+            #     return False
         gaussians.eval()
+        # gaussians._sem_logits = torch.nn.Parameter(sem_logits.to(gaussians._anchor.device))
+        # gaussians.num_classes = sem_logits.shape[1]
 
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -166,11 +272,12 @@ if __name__ == "__main__":
     pipeline = PipelineParams(parser)
     parser.add_argument("--iteration", default=-1, type=int)
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--mesh_type", default="mcube", type=str)
+    parser.add_argument("--mesh_type", default="poisson", type=str)
+    parser.add_argument("--checkpoint_path")
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.mesh_type)
+    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.mesh_type, args.checkpoint_path)

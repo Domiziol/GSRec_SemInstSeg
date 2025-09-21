@@ -8,6 +8,8 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
+
+
 import os
 import numpy as np
 
@@ -97,10 +99,41 @@ def expand_indices(index_tensor, num_indices):
 
     return result
 
+def get_classes():
+    classes= []
+
+    with open("info_semantic.json", 'r') as classes_file:
+        data = json.load(classes_file)
+
+    for objects in data['classes']:
+        classes.append(objects['name'])
+
+    # device = "cuda" if torch.cuda.is_available() else "cpu"
+    # clip_model, clip_preprocess = clip.load("ViT-B/16", device=device)
+
+    return classes
+
+def score_to_weight(scores, lo=0.20, hi=0.35, w_min=0.10):
+    w = (scores - lo) / max(1e-6, (hi - lo))
+    w = torch.clamp(w, 0.0, 1.0)
+    return torch.clamp(w, w_min, 1.0)
+    
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None, vis=False, k_near=50, sampling_numbers=8192, learn_sdf=False):
+    
+    # semantic
+    classes = get_classes()
+    class_to_idx = {n:i for i,n in enumerate(classes)}
+    if not hasattr(opt, "lambda_sem"):
+        opt.lambda_sem = 0.0
+
+    SEM_DELAY  = 2000    # keep semantics off while geometry forms
+    SEM_WARMUP = 6000    # linearly ramp over 3k iters
+    SEM_TARGET = 0.05
+
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.implicit_sdf_divide_factor, dataset.sdf_inside_out, dataset.use_feat_bank)
+    # semantic (add classes in constructor)
+    gaussians = GaussianModel(classes, dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.implicit_sdf_divide_factor, dataset.sdf_inside_out, dataset.use_feat_bank)
     scene = Scene(dataset, gaussians, ply_path=ply_path)
     gaussians.training_setup(opt)
     if checkpoint:
@@ -116,7 +149,17 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
-    for iteration in range(first_iter, opt.iterations + 1):        
+    for iteration in range(first_iter, opt.iterations + 1):      
+
+        if iteration <= SEM_DELAY:
+            lambda_sem_now = 0.0
+        elif iteration <= SEM_DELAY + SEM_WARMUP:
+            alpha = (iteration - SEM_DELAY) / float(SEM_WARMUP)
+            lambda_sem_now = SEM_TARGET * alpha
+        else:
+            lambda_sem_now = SEM_TARGET
+
+        opt.lambda_sem = lambda_sem_now
         # if network_gui.conn == None:
         #     network_gui.try_connect()
         # while network_gui.conn != None:
@@ -145,19 +188,98 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
+        # Load masks for image (SAM+CLIP)
+        samclip_path = "./data/replica/scan1/masks_real2/"
+        image_name = viewpoint_cam.image_name
+        base = os.path.splitext(image_name)[0]
+        npz_path = os.path.join(samclip_path, f"{base}.npz")
+        # print(npz_path)
+        # semantic
+        
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
         
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
         retain_grad = (iteration < opt.update_until and iteration >= 0)
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad)
+
+        if os.path.isfile(npz_path):
+            npz = np.load(npz_path)
+            masks_np = npz["masks"]
+            labels_np = npz["labels"]
+            scores_np = npz["scores"]
+            if labels_np.size > 0:
+                classes_subset = np.unique(labels_np).tolist()  
+
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad, class_subset = classes_subset)
         
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity =\
             render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
 
         render_depth, render_normal, render_median_depth = render_pkg["render_depth"], render_pkg["render_normal"], render_pkg["render_median_depth"]
-        
+
+        # semantic loss (cross entropy)
+        p_sem = render_pkg["semantics"] # semantic
+        sem_loss = torch.tensor(0.0, device=image.device)
+
+        if os.path.isfile(npz_path):
+            # npz = np.load(npz_path)
+            # masks_np = npz["masks"]
+            # labels_np = npz["labels"]
+
+
+
+            if opt.lambda_sem > 0.0 and (p_sem is not None):
+                if masks_np.size > 0 and labels_np.size > 0:
+                    _, K, H, W = p_sem.shape
+                    M = masks_np.shape[0]
+                    masks_bool_t = torch.from_numpy(masks_np).to(torch.bool).to(image.device)  # [M,H,W]
+                    labels_t   = torch.from_numpy(labels_np).to(torch.long).to(image.device)
+                    scores_t = torch.from_numpy(scores_np).to(torch.float32).to(image.device)
+
+                    IGNORE = 255
+                    target_image = torch.full((H,W), IGNORE, dtype = torch.long, device = image.device)
+
+                    for idx in range(M):
+                        mask = masks_bool_t[idx]
+                        class_id = int(labels_t[idx].item())
+                        if 0 <= class_id < K:
+                            target_image[mask] = class_id
+
+                    # weight_masks = score_to_weight(scores_t)
+                    # weight_map = torch.ones((H,W), device=image.device, dtype=torch.float32)
+
+                    # for j in range(M):
+                    #     c = int(labels_t[j].item())
+                    #     if 0 <= c < K:
+                    #         weight_map[masks_bool_t[j]] = weight_masks[j]
+                    
+                    # log_p = torch.log(p_sem.clamp_min(1e-6))[0]     # [K,H,W]
+                    
+                    log_p = torch.log(p_sem.clamp_min(1e-6))          # [1, K, H, W]
+
+                    # target_image: [H, W] with ints in [0..K-1] or IGNORE
+                    target_batched = target_image.unsqueeze(0)
+                    
+                    # ce = F.nll_loss(                          
+                    #     input=log_p,
+                    #     target=target_batched,
+                    #     ignore_index=IGNORE,
+                    #     reduction="none"
+                    # )
+
+                    # valid = (target_image != IGNORE).unsqueeze(0).float()      # [1,H,W]
+                    # num   = (ce * weight_map.unsqueeze(0) * valid).sum()
+                    # den   = (weight_map.unsqueeze(0) * valid).sum().clamp_min(1.0)
+                    # sem_loss = num / den
+
+
+                    sem_loss = F.nll_loss(                          # single fused op, fast
+                        input=log_p,                                # [K,H,W]
+                        target=target_batched,                           # [K, H,W]
+                        ignore_index=IGNORE,
+                        reduction="mean"
+                    )
         
         # monocular depth loss
         gt_image = viewpoint_cam.original_image.cuda()
@@ -247,11 +369,63 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         loss += opt.lambda_normal_cos*normal_cos_loss +opt.lambda_normal_l1* normal_l1_loss  # 
         loss += opt.lambda_render_norm_reg * normal_grad_loss 
         loss += sdf_loss
+
+        loss += opt.lambda_sem * sem_loss   # semantic
         
         if torch.isnan(loss):
             print(viewspace_point_tensor.grad)
             assert not torch.isnan(loss), 'Failed at iter: {}'.format(iteration)
+
+        # logging -my
+        if tb_writer:
+            tb_writer.add_scalar(f'{dataset_name}/train/l1_rgb',        Ll1.item(), iteration)
+            tb_writer.add_scalar(f'{dataset_name}/train/ssim',          ssim_loss.item(), iteration)
+            tb_writer.add_scalar(f'{dataset_name}/train/depth',         depth_loss.item(), iteration)
+            tb_writer.add_scalar(f'{dataset_name}/train/normal_l1',     normal_l1_loss.item(), iteration)
+            tb_writer.add_scalar(f'{dataset_name}/train/normal_cos',    normal_cos_loss.item(), iteration)
+            tb_writer.add_scalar(f'{dataset_name}/train/normal_grad',   normal_grad_loss.item(), iteration)
+            tb_writer.add_scalar(f'{dataset_name}/train/scaling_reg',   scaling_reg.item(), iteration)
+            tb_writer.add_scalar(f'{dataset_name}/train/sdf',           sdf_loss.item(), iteration)
+            tb_writer.add_scalar(f'{dataset_name}/train/sem',           float(sem_loss), iteration)
+            tb_writer.add_scalar(f'{dataset_name}/train/total',         loss.item(), iteration)
+
+        if wandb is not None:
+            wandb.log({
+                "train/l1_rgb":      Ll1.item(),
+                "train/ssim":        ssim_loss.item(),
+                "train/depth":       depth_loss.item(),
+                "train/normal_l1":   normal_l1_loss.item(),
+                "train/normal_cos":  normal_cos_loss.item(),
+                "train/normal_grad": normal_grad_loss.item(),
+                "train/scaling_reg": scaling_reg.item(),
+                "train/sdf":         sdf_loss.item(),
+                "train/sem":         float(sem_loss),
+                "train/total":       loss.item(),
+                "iter":              iteration,
+            })
+        if iteration % 50 == 0 and logger is not None:
+            logger.info(
+                f"[{iteration}] total={loss.item():.4f} "
+                f"rgb={Ll1.item():.4f} ssim={ssim_loss.item():.4f} "
+                f"depth={depth_loss.item():.4f} normalL1={normal_l1_loss.item():.4f} "
+                f"normalCos={normal_cos_loss.item():.4f} sdf={sdf_loss.item():.4f} "
+                f"sem={float(sem_loss):.4f} λ_sem={opt.lambda_sem:.4f}"
+            )
+
+
+        should_expect_sem_grad = (
+            (sem_loss is not None)
+            and (torch.is_tensor(sem_loss))
+            and (sem_loss.requires_grad)
+            and (sem_loss.detach().item() > 0)
+            and (lambda_sem_now > 0)
+        )
+
         loss.backward()
+
+        if should_expect_sem_grad:
+            assert gaussians._sem_logits.grad is not None
+
         
         iter_end.record()
 
@@ -343,7 +517,7 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, sdf_loss, l1_
                     errormap_list = []
 
                 for idx, viewpoint in enumerate(config['cameras']):
-                    voxel_visible_mask = prefilter_voxel(viewpoint, scene.gaussians, *renderArgs)
+                    voxel_visible_mask = prefilter_voxel(viewpoint, scene.gaussians, *renderArgs)   # all anchors that projected radius > 0
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs, visible_mask=voxel_visible_mask)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     if tb_writer and (idx < 30):
@@ -460,11 +634,14 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     
     return t_list, visible_count_list
 
-def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train=True, skip_test=False, wandb=None, tb_writer=None, dataset_name=None, logger=None, poisson_depth=9):
+def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train=True, skip_test=False, wandb=None, tb_writer=None, dataset_name=None, logger=None, poisson_depth=8, checkpoint = False):
+    # semantic
+    classes = get_classes()
+    
     with torch.no_grad():
         # temoporally set the eval to True for visualization, if you are using the entire dataset for training, the numerical output is for subset of training set
         dataset.eval = True
-        gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank)
+        gaussians = GaussianModel(classes, dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         gaussians.eval()
 
@@ -596,6 +773,7 @@ def get_logger(path):
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
+    
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
@@ -604,10 +782,10 @@ if __name__ == "__main__":
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument('--use_wandb', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[3_000, 7_000, 15_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[3_000, 7_000, 15_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[3_000, 7_000, 15_000, 20_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[3_000, 7_000, 15_000, 20_000])
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[20_000, 30_000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--gpu", type=str, default = '-1')
     parser.add_argument("--knear", type=int, default=50)
@@ -664,6 +842,8 @@ if __name__ == "__main__":
     
     # training
 
+
+    # output/test1 - currently test how render works
     training(lp.extract(args), op.extract(args), pp.extract(args), dataset,  args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, wandb, logger, k_near=args.knear)
 
     # All done

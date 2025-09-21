@@ -240,7 +240,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     else:
         return xyz, color, opacity, scaling, rot, normal
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, learn_SDF=True):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, learn_SDF=True, class_subset = None):  # visible_mask - all anchors which radius >0 (projected)
     """
     Render the scene. 
     
@@ -311,6 +311,74 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     render_normal = torch.nn.functional.normalize(render_normal, dim=0)
     render_normal = render_normal.contiguous()
     
+    # === NEW === # semantic
+    p_sem = None
+    if is_training and class_subset is not None:
+        # [N_anchor_total, K]
+        Pi_anchor = pc.get_sem_probs()   # softmax(_sem_logits) along classes
+        K = Pi_anchor.shape[1]
+        
+
+        # visible_mask: [N_anchor_total] (bool) — passed into this render()
+        # mask: [N_visible_anchors * n_offsets] (bool) — returned by generate_* (which offsets are active)
+        if visible_mask is not None:
+            anchor_idx_visible = torch.nonzero(visible_mask, as_tuple=False).squeeze(1)   # [N_visible_anchors]
+        else:
+            anchor_idx_visible = torch.arange(pc.get_anchor.shape[0], device=xyz.device)
+
+        N_vis_anchors = anchor_idx_visible.numel()
+        
+
+        # For each visible anchor, repeat its index n_offsets times to match flattened offsets:
+        owner_idx_full = anchor_idx_visible.repeat_interleave(pc.n_offsets)               # [N_visible_anchors * n_offsets]
+
+        # Select only the active offsets that produced xyz/color/etc.
+        gauss_mask = mask.view(-1)                                                       # [N_visible_anchors * n_offsets]
+        owner_idx = owner_idx_full[gauss_mask]                                           # [N_rendered_gaussians]
+        assert gauss_mask.numel() == N_vis_anchors * pc.n_offsets, \
+        "mask length must equal N_vis_anchors * n_offsets (anchor-major flattening)"
+        assert owner_idx.shape[0] == xyz.shape[0], \
+        f"owner_idx {owner_idx.shape} must match rendered gaussians {xyz.shape[0]}"
+
+        Pi_gauss = Pi_anchor[owner_idx]
+        assert Pi_gauss.shape == (xyz.shape[0], K)
+
+       
+        def render_scalar_field_as_image(x_scalar_per_gaussian: torch.Tensor) -> torch.Tensor:
+            # uses probabilities  as a 'color' input to rasterizer 
+            colors_precomp_x = x_scalar_per_gaussian.expand(-1, 3).contiguous()
+            color_x, _, _, _, _ = rasterizer(
+                means3D = xyz,
+                means2D = screenspace_points,
+                shs = None,
+                colors_precomp = colors_precomp_x,  
+                normal_precomp = pc.normal_activation(normal),
+                opacities = opacity,
+                scales = scaling,
+                rotations = rot,
+                cov3D_precomp = None
+            )
+            
+            if color_x.dim() == 3:
+                return color_x[0:1, :, :].unsqueeze(0)    # -> [1,1,H,W]
+            else:
+                return color_x[:, :1, :, :] 
+
+        # accumulate semantic 'color' s_c for each class
+        H, W = rendered_image.shape[-2], rendered_image.shape[-1]
+        p_sem = rendered_image.new_zeros((1, K, H, W))  # [1,K,H,W]
+        for c in class_subset:
+            x = Pi_gauss[:, c:c+1]               # [N_rendered_gaussians, 1]
+            s_c = render_scalar_field_as_image(x)  # [1,1,H,W]
+            p_sem[:, c:c+1, :, :] = s_c
+
+        ones = torch.ones((Pi_gauss.shape[0], 1), device=Pi_gauss.device, dtype=Pi_gauss.dtype)
+        S = render_scalar_field_as_image(ones)     # [1,1,H,W]
+
+        p_sem = p_sem / S.clamp_min(1e-6)  
+    # === END NEW ===
+
+    
     L = build_scaling_inv_rotation(scaling, rot)
     actu_cov3D = (L @ L.transpose(1, 2))
     cov3D = strip_symmetric(actu_cov3D)
@@ -334,7 +402,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 "normal_unmask": None if learn_SDF else normal_unmask,
                 "cov3D_unmask": None if learn_SDF else cov3D_unmask,
                 "opacity": opacity,
-                "visible_anchor": None if learn_SDF else visbile_anchor
+                "visible_anchor": None if learn_SDF else visbile_anchor,
+                "semantics": p_sem  # semantic
                 }
     else:
         return {"render": rendered_image,
@@ -351,7 +420,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 "offsets_unmask": None if learn_SDF else offsets_unmask,
                 "normal_unmask": None if learn_SDF else normal_unmask,
                 "cov3D_unmask": None if learn_SDF else cov3D_unmask,
-                "visible_anchor": None if learn_SDF else visbile_anchor
+                "visible_anchor": None if learn_SDF else visbile_anchor,
                 }
 
 

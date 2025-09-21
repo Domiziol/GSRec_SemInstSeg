@@ -46,13 +46,106 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     per_view_dict = {}
     # debug = 0
     t_list = []
+    import open3d as o3d
     
-    render_pkg = render(views[0], gaussians, pipeline, background, visible_mask=None)
+    render_pkg = render(views[5], gaussians, pipeline, background, visible_mask=None, learn_SDF=False)
+
+    camera = views[5]
+    view_matrix = camera.world_view_transform.cpu().numpy()
+    view_matrix = view_matrix.T
+    proj_matrix = camera.projection_matrix.cpu().numpy()
+    # print("View matrix:\n", view_matrix)
+    # print("Projection matrix:\n", proj_matrix)
+
+    # proj_matrix[2, 3] *= -1
+    # proj_matrix[2, 2] *= -1
+    proj_matrix = proj_matrix.T
+    # print("Projection matrix:\n", proj_matrix)
+
+
+    full_proj_transform = proj_matrix @ view_matrix
+    full_proj = camera.full_proj_transform.cpu().numpy()
+    # print("Full_proj_to_view:\n", full_proj_transform)
+    # print("Full_original:\n", full_proj)
+
+
+    visible_anchor = render_pkg["visible_anchor"].cpu().detach().numpy()
+
+    # print("visible_anchor min:", visible_anchor.min(axis=0))
+    # print("visible_anchor max:", visible_anchor.max(axis=0))
+
+
+
+    print("View matrix:\n", view_matrix)
+    print("Camera center:\n", camera.camera_center.cpu().numpy())
+    print("Projection matrix:\n", proj_matrix)
+
+
+    p = visible_anchor[0]
+    p_h = np.concatenate([p, [1]])
+    clip = full_proj_transform @ p_h
+
+    cam_space = view_matrix @ p_h
+    print("Camera space:", cam_space)
+    print("Z in camera space:", cam_space[2])
+    print("Camera pose (view matrix last row):", view_matrix[3])
+
+
+
+
+    print("||clip|| =", np.linalg.norm(clip[:3]))
+    print("clip.w =", clip[3])
+
+    ndc = clip[:3] / clip[3]
+
+    print("Single point clip:", clip)
+    print("NDC:", ndc)
+    cam_space = (view_matrix @ p_h.T).T
+    print("Camera-space point:", cam_space)
+
+
+
+
+    points_h = np.concatenate([visible_anchor, np.ones((visible_anchor.shape[0], 1))], axis=1)
+    clip_coords = (full_proj_transform @ points_h.T).T
+    w = clip_coords[:, 3]
+    print("clip w min:", w.min(), "max:", w.max())
+
+    ndc = clip_coords[:, :3] / clip_coords[:, 3:4]
+    W, H = camera.image_width, camera.image_height
+    u = np.round((ndc[:, 0] + 1) * 0.5 * W).astype(int)
+    v = np.round((1 + ndc[:, 1]) * 0.5 * H).astype(int)
+    mask = np.zeros((H, W), dtype=np.uint8)
+
+    # Keep only points within image bounds and in front of the camera
+    valid = (u >= 0) & (u < W) & (v >= 0) & (v < H) & (clip_coords[:, 3] > 0)
+
+    u_valid = u[valid]
+    v_valid = v[valid]
+    mask[v_valid, u_valid] = 255
+
+    print("liczba anchor points na obrazie: \n", len(u_valid))
+
+
+    plt.imshow(mask, cmap='gray')
+    plt.title("Visible Anchor Projection")
+    plt.axis('off')
+    plt.show()
+
+
+    camera_center = camera.camera_center.cpu().detach().numpy()
+    camera_marker = o3d.geometry.TriangleMesh.create_sphere(radius=0.02)
+    camera_marker.translate(camera_center)
+    camera_marker.paint_uniform_color([1.0, 0.0, 0.0])
+
+    pcd2 = o3d.geometry.PointCloud()
+    pcd2.points = o3d.utility.Vector3dVector(visible_anchor)
+    o3d.visualization.draw_geometries([pcd2, camera_marker])
     points = render_pkg["points"].cpu().detach().numpy()
     points_normals = torch.nn.functional.normalize(render_pkg["normal"], dim=-1).cpu().detach().numpy()
     vertices, triangle, pcd = poisson_surface_reconstruction(points, points_normals, 9)
     # use open3d to save the mesh
-    import open3d as o3d
+    
     mesh = o3d.geometry.TriangleMesh()
     mesh.vertices = o3d.utility.Vector3dVector(vertices)
     mesh.triangles = o3d.utility.Vector3iVector(triangle)
@@ -74,7 +167,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     normals = np.asarray(pcd.normals)
     scaled_normals = normals * 0.1
     pcd.normals = o3d.utility.Vector3dVector(scaled_normals)
-    o3d.visualization.draw_geometries([pcd], point_show_normal=True)
+    # o3d.visualization.draw_geometries([pcd], point_show_normal=True)
     # mesh.compute_vertex_normals()
     o3d.io.write_triangle_mesh(os.path.join(model_path, name, "ours_{}".format(iteration), '{0:05d}'.format(0) + ".ply"), mesh)
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
@@ -121,14 +214,36 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
     with open(os.path.join(model_path, name, "ours_{}".format(iteration), "per_view_count.json"), 'w') as fp:
             json.dump(per_view_dict, fp, indent=True)      
-     
+
+def get_classes():
+    classes= []
+
+    with open("info_semantic.json", 'r') as classes_file:
+        data = json.load(classes_file)
+
+    for objects in data['classes']:
+        classes.append(objects['name'])
+
+    # device = "cuda" if torch.cuda.is_available() else "cpu"
+    # clip_model, clip_preprocess = clip.load("ViT-B/16", device=device)
+
+    return classes
+
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
+    skip_test = False
+    skip_train = False
+    classes = get_classes()
     with torch.no_grad():
         dataset.eval = True
-        gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank)
+        gaussians = GaussianModel(classes, dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank)
+        
+        # visible_mask = torch.ones(gaussians.get_anchor.shape[0], dtype=torch.bool, device = gaussians.get_anchor.device)
+        # all_anchors = gaussians.get_anchor[visible_mask]
+        # all_anchors = all_anchors.cpu().detach().numpy()
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         
         gaussians.eval()
+        anchor = gaussians._anchor.detach().cpu().numpy()
 
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")

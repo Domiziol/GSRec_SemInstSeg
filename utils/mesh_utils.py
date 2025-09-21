@@ -8,7 +8,8 @@ def poisson_surface_reconstruction(points, normals=None, depth=9):
     
     import open3d as o3d
     
-    ori_pcd = o3d.geometry.PointCloud()    
+    ori_pcd = o3d.geometry.PointCloud()  
+      
     ori_pcd.points = o3d.utility.Vector3dVector(points)
     # remove outliers
     # import pdb; pdb.set_trace()
@@ -26,6 +27,7 @@ def poisson_surface_reconstruction(points, normals=None, depth=9):
     center = np.zeros(3)
     obb = o3d.geometry.OrientedBoundingBox(center, R, extent)
     pcd = ori_pcd.crop(obb)
+    
         
     mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=depth,linear_fit=True)
     # o3d.visualization.draw_geometries([mesh])

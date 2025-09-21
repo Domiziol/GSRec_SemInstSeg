@@ -1,7 +1,7 @@
 #!/bin/bash
 python train.py\
     --gpu 0\
-    -s ./data/scan1/ --voxel_size 0.001\
+    -s ./data/replica/scan1/ --voxel_size 0.001\
     --update_init_factor 16\
     --iterations 30000\
     --mlp_sdf_lr_init 0.0005\
@@ -13,4 +13,4 @@ python train.py\
     --sdf_inside_out\
     --eval\
     --sdf_start_iter 15000\
-    -m outputs/scan1
+    -m outputs/test5_d2k_w6k_t0.05_maskswithcontext
