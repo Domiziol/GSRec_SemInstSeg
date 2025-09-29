@@ -1,5 +1,9 @@
 /data/
 /outputs/
-/__pycache__/
+__pycache__/
 /sam_model/
 /vdbfusion/
+*.o
+/tmp_build/
+*.so
+*.ply

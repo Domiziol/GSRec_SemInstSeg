@@ -240,6 +240,21 @@ def find_mask_for_point(masks, u, v):
             return m
     return None
 
+def get_masks(viewpoint_cam):
+    # Load masks for image (SAM+CLIP)
+    samclip_path = "./data/replica/scan1/masks_real2/"
+    image_name = viewpoint_cam.image_name
+    base = os.path.splitext(image_name)[0]
+    npz_path = os.path.join(samclip_path, f"{base}.npz")
+
+    if os.path.isfile(npz_path):
+        npz = np.load(npz_path)
+        masks_np = npz["masks"]
+        labels_np = npz["labels"]
+        scores_np = npz["scores"]
+            
+    return masks_np
+
 from collections import defaultdict
 def get_semantic_anchors(anchor3D_info, views):
     predictor = init_automatic_sam()
@@ -264,7 +279,8 @@ def get_semantic_anchors(anchor3D_info, views):
     for view_id, items in view_points.items():
         gt_image = get_original_image(views[view_id])
         
-        masks = predictor.generate(gt_image)
+        # masks = predictor.generate(gt_image)
+        masks = get_masks(views[view_id])
 
         for m in masks:
             crop = crop_bbox_from_mask(m["segmentation"], gt_image)
