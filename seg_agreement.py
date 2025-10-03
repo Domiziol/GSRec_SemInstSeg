@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import os
 
 from scene import Scene
 from utils.general_utils import safe_state
@@ -15,6 +16,8 @@ from sklearn.cluster import DBSCAN, Birch, OPTICS
 from sklearn.neighbors import KDTree, NearestNeighbors
 import scipy.special as sp
 from scipy.spatial.distance import jensenshannon, pdist
+from scipy.sparse import csr_matrix
+
 
 
 
@@ -111,7 +114,7 @@ def view_projection(anchors, anchors_id, view): #, gaussianModel, pipeline, back
     # projected_anchors["points"] = [v_valid, u_valid]
     # projected_anchors["global_id"] = visible_ids
 
-    print("valid = ", valid.shape[0])
+    # print("valid = ", valid.shape[0])
 
     # plt.imshow(mask, cmap='gray')
     # plt.title("Visible Anchor Projection")
@@ -157,7 +160,7 @@ def palette_from_labels(labels, s=0.65, v=0.95):
         table[i] = (r, g, b)
     return table
 
-def contrast_palette(labels, s=0.85, v=0.98, noise_gray=0.30):
+def contrast_palette(labels, s=0.85, v=0.98, noise_gray=0.00):
     """
     Drop-in replacement: returns an (L,3) RGB table in [0,1],
     with well-separated hues. If -1 is among `labels`, the first
@@ -184,6 +187,42 @@ def contrast_palette(labels, s=0.85, v=0.98, noise_gray=0.30):
 
     return table
 
+def generate_sam_data_for_anchors(anchor_points, all_views, files_path, anchor_ids = None):
+    N = anchor_points.shape[0]
+    V = len(all_views)
+
+    if anchor_ids is None:
+        anchor_ids = np.arange(anchor_points.shape[0])
+
+    projection_data = np.full((N, V), -1, dtype = np.int32)
+
+    for v_id, view in enumerate(all_views):
+        visible_ids, v, u = view_projection(anchor_points, anchor_ids, view)
+
+        if visible_ids.size == 0:
+            continue
+
+        image_name = view.image_name
+        base = os.path.splitext(image_name)[0]
+        npz_path = os.path.join(files_path, f"{base}.npz")
+
+        if os.path.isfile(npz_path):
+            npz = np.load(npz_path)
+            masks = npz["masks"].astype(bool)
+
+            M, H, W = masks.shape
+
+            local = np.full((H,W), -1, dtype=np.int32)
+
+            for mask_id in range(M):
+                local[masks[mask_id]] = mask_id
+            
+            local_mask_id = local[v,u]
+            positive = local_mask_id != -1
+            projection_data[visible_ids[positive], v_id] = local_mask_id[positive]
+
+    return projection_data
+
 if __name__ == "__main__":
     # Set up command line argument parser with default parameters
     parser = ArgumentParser(description="Testing script parameters")
@@ -192,9 +231,12 @@ if __name__ == "__main__":
     parser.add_argument("--iteration", default=30000, type=int)
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--skip_train", default=False)
-    parser.add_argument("--skip_test", default=True)
+    parser.add_argument("--skip_test", default=False) # from True
     parser.add_argument("--checkpoint_path")
     args = get_combined_args(parser)
+
+    files_path = "./data/replica/scan1/masks_real2/"
+
 
     # Initialize system state (RNG) -- what is that ????
     safe_state(args.quiet)
@@ -224,11 +266,10 @@ if __name__ == "__main__":
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
 
-
+    projection_data = generate_sam_data_for_anchors(anchor_points, all_views, files_path, anchor_id)
     # ===   
 
     probs = sp.softmax(logits, axis = 1).astype(np.float32)
-    maxes = np.max(probs, axis=1)
     prob_squares = np.sqrt(probs)
 
     K = probs.shape[1]
@@ -237,61 +278,33 @@ if __name__ == "__main__":
     Z = U / np.sqrt(2.0) 
 
     A = anchor_points.astype(np.float32)
-    A = (A - A.mean(axis=0)) / (A.std(axis=0) + 1e-12)  #uśrednienie do sterowania std zamiast cm
-
-    
-    w_xyz = 1
-    w_sem = 0.1
+    # A = (A - A.mean(axis=0)) / (A.std(axis=0) + 1e-12)  #uśrednienie do sterowania std zamiast cm, pomogło chyba (wyniki z niżej były na tym)
     # X = np.hstack([anchor_points.astype(np.float32) / w_xyz, Z / w_sem]).astype(np.float32)
     # X = anchor_points.astype(np.float32) / w_xyz
     # X = Z.astype(np.float32) / w_sem
 
-    rng = np.random.default_rng()
-    arr = rng.integers(-1, 21, size=(100_000,100), dtype=np.int8)
-
-    from sklearn.preprocessing import StandardScaler
-    def make_int8_blobs(n_samples=100_000, n_features=100, n_clusters=5):
-        # pick integer centers in [-1, 20]
-        centers = rng.integers(-1, 21, size=(n_clusters, n_features))
-        # assign each sample to a cluster
-        which = rng.integers(0, n_clusters, size=n_samples)
-        # gaussian noise around the chosen center (float), then clip & cast
-        X = centers[which] + rng.normal(0, 1.0, size=(n_samples, n_features))
-        X = np.clip(np.rint(X), -1, 20).astype(np.int8)   # still clustered, but quantized
-        return X
-
-    X_int8 = make_int8_blobs()
-    # Scale to float for DBSCAN distance calculations
-    X = StandardScaler(with_mean=True, with_std=True).fit_transform(X_int8)
-
-    # X = arr
 
     # min_samples = 20  # try 12–25 for 1-1
     min_samples = 20        
     eps = 0.2 # got killed, last one working was 0.1
-    
     # for xyz only - top min_smaples 40/50, eps = 0.8, w_xyz = 0.04
 
-    # tree = KDTree(Z, leaf_size=40, metric="euclidean")
-    # cnt = np.asarray(tree.query_radius(Z, r=eps, count_only=True))
-
-    Z_norm = Z / w_sem
 
 
     # change from Z to Z_norm everywhere
-    idx = np.random.choice(len(Z), size=min(2000, len(Z)), replace=False)
-    E = np.linalg.norm(Z[idx,None]-Z[None,idx], axis=-1)
-    Dq = np.quantile(np.linalg.norm(Z[idx,None]-Z[None,idx], axis=-1), [0.1, 0.5, 0.9])
-    print("Hellinger dist quantiles:", Dq)
+    # idx = np.random.choice(len(Z), size=min(2000, len(Z)), replace=False)
+    # E = np.linalg.norm(Z[idx,None]-Z[None,idx], axis=-1)
+    # Dq = np.quantile(np.linalg.norm(Z[idx,None]-Z[None,idx], axis=-1), [0.1, 0.5, 0.9])
+    # print("Hellinger dist quantiles:", Dq)
 
-    m = min(2000, len(Z))
-    idx = np.random.choice(len(Z), size=m, replace=False)
-    Zs = Z[idx].astype(np.float32)
+    # m = min(2000, len(Z))
+    # idx = np.random.choice(len(Z), size=m, replace=False)
+    # Zs = Z[idx].astype(np.float32)
 
-    dists = pdist(Zs, metric='euclidean')  # this is Hellinger since Z = sqrt(p)/√2
-    print("Hellinger pairwise quantiles (0.1, 0.5, 0.9):",
-        np.quantile(dists, [0.1, 0.5, 0.9]))
-    print("min nonzero distance:", float(dists.min()))
+    # dists = pdist(Zs, metric='euclidean')  # this is Hellinger since Z = sqrt(p)/√2
+    # print("Hellinger pairwise quantiles (0.1, 0.5, 0.9):",
+    #     np.quantile(dists, [0.1, 0.5, 0.9]))
+    # print("min nonzero distance:", float(dists.min()))
 
     def hellinger(a,b):
         return np.linalg.norm(a[-K:] - b[-K:])
@@ -306,123 +319,131 @@ if __name__ == "__main__":
         return 1-num / denom
     
 
-    from scipy.sparse import csr_matrix
-
-    # --- your data generation ---
-    # X_int8: (N, D) in int8, values -1..20
-    # X: (N, D) float (scaled) for *candidate search only*
-    # keep both around
-    # X_int8 = make_int8_blobs()
-    # X = StandardScaler(with_mean=True, with_std=True).fit_transform(X_int8)
-
-    # --- your custom distance on int8 (vectorized to many) ---
-    def agreement_many(a_row: np.ndarray, B: np.ndarray) -> np.ndarray:
-        """
-        a_row: (D,) int8 row
-        B    : (M, D) int8 rows
-        returns: (M,) float32 distances in [0,1]
-        distance = 1 - (# equal & >0) / (# both >0), with denom==0 -> 1.0
-        """
-        # both positive mask per row
-        both_pos = (a_row > 0) & (B > 0)
-        denom = np.count_nonzero(both_pos, axis=1)
-        # equal on positive positions
-        num = np.count_nonzero((B == a_row) & both_pos, axis=1)
-        out = np.ones(B.shape[0], dtype=np.float32)
-        mask = denom > 0
-        out[mask] = 1.0 - (num[mask] / denom[mask])
+    
+    
+    def agreement_many(mask_ids_i, mask_ids_B):
+        vis_i  = mask_ids_i != -1
+        vis_B  = mask_ids_B != -1
+        co_vis = vis_B & vis_i
+        denom  = np.count_nonzero(co_vis, axis=1)
+        same   = (mask_ids_B == mask_ids_i) & co_vis
+        num    = np.count_nonzero(same, axis=1)
+        out = np.ones(mask_ids_B.shape[0], dtype=np.float32)
+        m = denom > 0
+        out[m] = 1.0 - (num[m] / denom[m])
         return out
+    
+    def agreement_single(mask_ids_i: np.ndarray, mask_ids_j: np.ndarray) -> float:
+        
+        vis = (mask_ids_i != -1) & (mask_ids_j != -1)
+        denom = int(np.count_nonzero(vis))
+        if denom == 0:
+            return 1.0
+        num = int(np.count_nonzero((mask_ids_i == mask_ids_j) & vis))
+        return 1.0 - (num / denom)
     
     def hellinger_many(a_tail: np.ndarray, B_tail: np.ndarray) -> np.ndarray:
         # a_tail, B_tail are the last K dims (already any transform you want)
         diff = B_tail - a_tail  # (M,K)
         return np.sqrt(np.sum(diff * diff, axis=1)).astype(np.float32)
+    
+    def euclidean_many(point, neighbours: np.ndarray) -> np.ndarray:
+        diff = neighbours - point
+        d2 = np.einsum('ij,ij->i', diff, diff, optimize=True)
+        return np.sqrt(d2, dtype=np.float32)
 
-    # --- build sparse eps-graph using k-NN candidates ---
-    def build_eps_graph_precomputed(
-        X_float: np.ndarray,
-        eps: float,
-        *,
-        metric: str,
-        k_candidates: int = 128,
-        leaf_size: int = 40,
-        # only for agreement:
-        X_int8: np.ndarray | None = None,
-        # only for hellinger:
-        K: int | None = None
-    ):
-        """
-        Build a symmetric CSR with only distances <= eps (good for DBSCAN(metric='precomputed')).
 
-        X_float : (N,Df) float32 — used for fast candidate search (kNN, Euclidean).
-                For 'hellinger', it should also contain the last K dims used by the metric.
-        eps     : threshold for the chosen metric.
-        metric  : 'agreement' or 'hellinger'
-        k_candidates : ~64–256 (# of neighbors per point to test)
-        X_int8  : (N,D0) int8 — required for 'agreement'
-        K       : int — number of tail dims for 'hellinger' (uses X_float[:, -K:])
-        """
-        N = X_float.shape[0]
-        nn = NearestNeighbors(
-            n_neighbors=min(k_candidates + 1, N),
-            algorithm="ball_tree",
-            metric="euclidean",
-            leaf_size=leaf_size,
-            n_jobs=-1,
-        ).fit(X_float)
-
-        _, inds = nn.kneighbors(X_float, return_distance=True)
+    def build_precomputed(anchor_points: np.ndarray, projection_data: np.ndarray, eps: float, k_candidates: int = 512):
+        
+        mask_ids = projection_data
+        N, V = mask_ids.shape
 
         rows, cols, data = [], [], []
-        if metric == "agreement":
-            assert X_int8 is not None, "X_int8 required for 'agreement'"
-            for i in range(N):
-                neigh = inds[i][1:]  # drop self
-                if neigh.size == 0: 
-                    continue
-                d = agreement_many(X_int8[i], X_int8[neigh])
-                keep = np.where(d <= eps)[0]
-                if keep.size:
-                    j = neigh[keep]
-                    rows.extend([i] * keep.size); cols.extend(j.tolist()); data.extend(d[keep].tolist())
 
-        elif metric == "hellinger":
-            assert K is not None and K > 0, "Provide K for 'hellinger'"
-            tails = X_float[:, -K:].astype(np.float32, copy=False)
-            for i in range(N):
-                neigh = inds[i][1:]
-                if neigh.size == 0:
-                    continue
-                d = hellinger_many(tails[i], tails[neigh])  # any scaling you want is already in tails
-                keep = np.where(d <= eps)[0]
-                if keep.size:
-                    j = neigh[keep]
-                    rows.extend([i] * keep.size); cols.extend(j.tolist()); data.extend(d[keep].tolist())
-        else:
-            raise ValueError("metric must be 'agreement' or 'hellinger'")
+        
+        nn = NearestNeighbors(
+            n_neighbors=min(k_candidates + 1, N),
+            metric="euclidean",
+            algorithm="ball_tree",
+            n_jobs=-1,
+        ).fit(anchor_points.astype(np.float32, copy=False))
+
+        dists, inds = nn.kneighbors(anchor_points, return_distance=True)
+        rk = dists[:, -1]                                  # k-distance per point
+        r_s = float(np.percentile(rk, 80))
+
+        anchor_points = anchor_points / r_s
+
+
+        for i in range(N):
+            neigh = inds[i][1:]  # drop self
+            if neigh.size == 0:
+                continue
+            diff = anchor_points[i] - anchor_points[neigh]
+            d_euc = np.sqrt(np.einsum('ij,ij->i', diff, diff, optimize=True))
+            keep_euc = d_euc <= eps
+            if not np.any(keep_euc):
+                continue
+            candidates = neigh[keep_euc]
+
+            d = agreement_many(mask_ids[i], mask_ids[candidates])
+            keep = np.where(d <= eps)[0]
+            if keep.size:
+                j = neigh[keep]
+                rows.extend([i] * keep.size)
+                cols.extend(j.tolist())
+                data.extend(d[keep].tolist())
 
         A = csr_matrix((np.asarray(data, np.float32), (np.asarray(rows), np.asarray(cols))), shape=(N, N))
         A = A.maximum(A.T)  # symmetrize
         return A
-    # --- usage ---
-    eps = 0.2          # threshold for your agreement distance (tune!)
-    k_candidates = 128 # try 64–256; larger = more complete, slower
+    
+    def build_precomputed_single(projection_data, eps):
+        N = projection_data.shape[0]
 
-    # A = build_eps_graph_precomputed(X_float=X, X_int8=X_int8, eps=eps, k_candidates=k_candidates)
+        rows, cols, data = [], [], []
+        for i in range(N):
+            point = projection_data[i]
+            for j in range(i + 1, N):
+                d = agreement_single(point, projection_data[j])
+                if d <= eps:
+                    rows.append(i); cols.append(j); data.append(d)
 
-    # # Run DBSCAN with the sparse precomputed matrix
-    # labels = DBSCAN(eps=eps, min_samples=10, metric="precomputed", n_jobs=-1).fit_predict(A)
+        A = csr_matrix((np.asarray(data, np.float32), (np.asarray(rows), np.asarray(cols))), shape=(N, N))
+        A = A.maximum(A.T)  # symmetrize
+        return A
+    
+    # tree = KDTree(anchor_points, leaf_size=40, metric='euclidean')
 
-    ####
+    # # counts of neighbors within r (includes self)
+    # counts_including_self = tree.query_radius(anchor_points, r=1, count_only=True)
 
-    A = build_eps_graph_precomputed(
-        X_float=Z.astype(np.float32),
+    # # exclude self, get stats
+    # counts = counts_including_self - 1
+    # mean_neighbors = float(np.mean(counts))
+    # p50, p90, p99 = np.percentile(counts, [50, 90, 99])
+
+    # print("mean neighbors:", mean_neighbors)
+    # print("median / p90 / p99:", p50, p90, p99)
+    
+
+    eps = 0.1          
+    # k_candidates = 512 
+
+    # A = build_precomputed_single(
+    #     projection_data,
+    #     eps=eps,
+    # )
+
+    A = build_precomputed(
+        anchor_points,
+        projection_data,
         eps=eps,
-        metric='hellinger',
-        k_candidates=128,
-        K=Z.shape[1]
+        k_candidates=512
     )
     labels = DBSCAN(eps=eps, min_samples=min_samples, metric='precomputed').fit_predict(A)
+
+    # for agreement only - eps=0.1, k_n = 512
 
 
     # db = DBSCAN(
@@ -435,36 +456,6 @@ if __name__ == "__main__":
     #     # leaf_size=100,
     # )
     # labels = db.fit_predict(X)
-
-    # db = DBSCAN(
-    #     eps=eps,
-    #     min_samples=min_samples,
-    #     # metric='euclidean',
-    #     # algorithm="ball_tree",
-    #     metric=agreement,
-    #     algorithm="brute",
-    #     # leaf_size=100,
-    # )
-    # labels = db.fit_predict(X)
-
-    
-
-    # nbrs = NearestNeighbors(n_neighbors=50, algorithm='ball_tree', metric=agreement)
-    # labels = nbrs.fit(X)
-
-    # db = OPTICS(
-    #     eps=eps,
-    #     max_eps=eps+0.05,
-    #     min_samples=min_samples,
-    #     metric=agreement,
-    #     cluster_method='dbscan',
-    #     algorithm='ball_tree'
-    #     # leaf_size=100,
-    #              # if your scikit-learn version supports it
-    # )
-    # labels = db.fit_predict(np.asarray(X, dtype=np.float32))
-
-    
     
     # ===
 
@@ -500,51 +491,7 @@ if __name__ == "__main__":
     v_colors = anchors_colors[idx] 
     mesh.vertex_colors = o3d.utility.Vector3dVector(v_colors.astype(np.float64))
     
-    o3d.io.write_triangle_mesh("mesh_2test2.ply", mesh, write_vertex_colors=True)
-
-
-
-    # anchor3D_info = {
-    # int(global_id): {
-    #     "point3D": np.array(point, dtype=np.float32),
-    #     "projection_info": {}
-    # }
-    # for global_id, point in zip(anchor_id, anchor_points)
-    # }
-
-
-
-    # for view_id, view in enumerate(all_views):
-    #     #if view_id == 0:
-    #     visible_ids, v_valid, u_valid = view_projection(anchor_points, anchor_id, all_views[view_id])   #, gaussianModel, pipeline, background)
-
-    #     for aid, v, u in zip(visible_ids, v_valid, u_valid):
-    #         anchor3D_info[aid]["projection_info"][int(view_id)] = np.array([[v, u]], dtype=np.float32)
-
-
-
-
-
-
-        
-
-## SAVE ANCHOR 3D STRUCT ##
-
-# import json
-
-# def to_jsonable(obj):
-#     if isinstance(obj, dict):
-#         return {k: to_jsonable(v) for k, v in obj.items()}
-#     elif isinstance(obj, np.ndarray):
-#         return obj.tolist()
-#     elif isinstance(obj, (list, tuple)):
-#         return [to_jsonable(v) for v in obj]
-#     else:
-#         return obj
-
-
-# with open("anchors3d.json", "w") as f:
-#     json.dump(to_jsonable(anchor3D_info), f, indent=2)
+    o3d.io.write_triangle_mesh("mesh_letsee.ply", mesh, write_vertex_colors=True)
 
 
 
