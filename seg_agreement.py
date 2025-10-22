@@ -253,12 +253,6 @@ if __name__ == "__main__":
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
     all_views = get_views(scene, skip_train=args.skip_train, skip_test = args.skip_test)
-
-    gaussianModel, scene, all_anchor_points_cuda, sem_logits = setup_gaussian_scene_and_model(
-        model.extract(args), 
-        args.iteration,
-        args.checkpoint_path
-        )
     
     anchor_id = np.arange(anchor_points.shape[0])
 
@@ -369,30 +363,48 @@ if __name__ == "__main__":
         ).fit(anchor_points.astype(np.float32, copy=False))
 
         dists, inds = nn.kneighbors(anchor_points, return_distance=True)
-        rk = dists[:, -1]                                  # k-distance per point
-        r_s = float(np.percentile(rk, 80))
+        # rk = dists[:, -1]                                  # k-distance per point
+        # r_s = float(np.percentile(rk, 80))
+        # r_s = np.max(dists)
 
-        anchor_points = anchor_points / r_s
-
+        # anchor_points = anchor_points / r_s
+        w_euc = 1
+        w_agr = 0
 
         for i in range(N):
             neigh = inds[i][1:]  # drop self
-            if neigh.size == 0:
-                continue
-            diff = anchor_points[i] - anchor_points[neigh]
+            mask = np.ones(N, dtype=bool)
+            mask[i] = False
+            diff = anchor_points[mask] - anchor_points[i]   # (N-1, 3)
             d_euc = np.sqrt(np.einsum('ij,ij->i', diff, diff, optimize=True))
-            keep_euc = d_euc <= eps
-            if not np.any(keep_euc):
-                continue
-            candidates = neigh[keep_euc]
 
-            d = agreement_many(mask_ids[i], mask_ids[candidates])
+
+            # diff = anchor_points - anchor_points[i]          # (N,3)
+            # d_euc = np.linalg.norm(diff, axis=1)             # (N,)
+            # d_euc[i] = np.inf
+            # keep_euc = d_euc <= 0.4
+            # if not np.any(keep_euc):
+            #     continue
+            # candidates = neigh[keep_euc]
+
+            d_agr = agreement_many(mask_ids[i], mask_ids[mask])
+
+            d = w_euc * d_euc + w_agr * d_agr
             keep = np.where(d <= eps)[0]
             if keep.size:
                 j = neigh[keep]
                 rows.extend([i] * keep.size)
                 cols.extend(j.tolist())
                 data.extend(d[keep].tolist())
+            # keep_idx = np.flatnonzero(d_agr <= eps)          # indices j (global)
+            # if keep_idx.size == 0:
+            #     continue
+            # j = keep_idx
+            # vals = d_agr[keep_idx]
+
+            # rows.extend([i] * j.size)
+            # cols.extend(j.tolist())
+            # data.extend(vals.tolist())
 
         A = csr_matrix((np.asarray(data, np.float32), (np.asarray(rows), np.asarray(cols))), shape=(N, N))
         A = A.maximum(A.T)  # symmetrize
@@ -427,7 +439,7 @@ if __name__ == "__main__":
     # print("median / p90 / p99:", p50, p90, p99)
     
 
-    eps = 0.1          
+    eps = 0.1         
     # k_candidates = 512 
 
     # A = build_precomputed_single(
@@ -439,7 +451,7 @@ if __name__ == "__main__":
         anchor_points,
         projection_data,
         eps=eps,
-        k_candidates=512
+        k_candidates=2048 # killed for 4096 (eps = 0.1)
     )
     labels = DBSCAN(eps=eps, min_samples=min_samples, metric='precomputed').fit_predict(A)
 
@@ -491,8 +503,9 @@ if __name__ == "__main__":
     v_colors = anchors_colors[idx] 
     mesh.vertex_colors = o3d.utility.Vector3dVector(v_colors.astype(np.float64))
     
-    o3d.io.write_triangle_mesh("mesh_letsee.ply", mesh, write_vertex_colors=True)
+    o3d.io.write_triangle_mesh("wyniki_inst/precomp_eps0.02_kn2048_euconly_v3_ontest3model.ply", mesh, write_vertex_colors=True)
 
 
 
-    
+    # NOTES
+    # for euclidean only, best where for eps=0.02, kn=2048 and without / r_s
