@@ -29,7 +29,8 @@ import trimesh
 import vdbfusion
 from utils.graphics_utils import depth2point
 
-
+from sklearn.neighbors import NearestNeighbors
+from scipy.special import softmax
 from scipy.spatial import ckdtree
 
 def get_grid_uniform(resolution, grid_boundary=[-2.0, 2.0]):
@@ -88,12 +89,15 @@ def get_surface_trace(path, gs, resolution=100, grid_boundary=[-2.0, 2.0], retur
 import colorsys
 
 def palette_from_classes(classes, s=0.65, v=0.95):
-    n = max(1, len(classes))
-    table = np.zeros((len(classes), 3), dtype=np.float32)
+    n = max(1, len(classes)+1)
+    table = np.zeros((len(classes)+1, 3), dtype=np.float32)
     for i, _ in enumerate(classes):
         h = i / n
         r, g, b = colorsys.hsv_to_rgb(h, s, v)
         table[i] = (r, g, b)
+
+    if np.any(np.asarray(classes) == -1):
+        table[102] = (0.6, 0.6, 0.6)
     return table 
 
 def get_classes():
@@ -105,10 +109,132 @@ def get_classes():
     for objects in data['classes']:
         classes.append(objects['name'])
 
-    # device = "cuda" if torch.cuda.is_available() else "cpu"
-    # clip_model, clip_preprocess = clip.load("ViT-B/16", device=device)
-
     return classes
+
+def weighted_logit_mean(
+    anchors_xyz,
+    logits,
+    k=50,
+    self_weight=1.0,
+    use_entropy=True,
+    alpha=0.5):
+
+    N, K = logits.shape
+
+    idx_sorted = np.argsort(logits, axis=1)
+    top1 = logits[np.arange(N), idx_sorted[:, -1]]
+    top2 = logits[np.arange(N), idx_sorted[:, -2]]
+    margin = top1 - top2
+    conf_margin = 1.0 / (1.0 + np.exp(-margin / 2.0))
+
+    if use_entropy:
+        z = logits - logits.max(axis=1, keepdims=True)
+        ez = np.exp(z)
+        sum_ez = ez.sum(axis=1, keepdims=True)
+        P = ez / np.clip(sum_ez, 1e-12, None)
+        # H = -sum p*log p
+        H = -(P * np.log(np.clip(P, 1e-12, 1.0))).sum(axis=1)
+        Hmax = np.log(K)
+        conf_entropy = 1.0 - H / (Hmax + 1e-12)
+        
+        conf = alpha * conf_entropy + (1.0 - alpha) * conf_margin
+    else:
+        conf = conf_margin
+
+    nn = NearestNeighbors(n_neighbors=min(k, N)).fit(anchors_xyz)
+    dists, nbr_idx = nn.kneighbors(anchors_xyz, return_distance=True)
+
+    nz = dists[dists > 0]
+    sigma_s = (np.median(nz) if nz.size else 1.0) + 1e-9
+
+    W = np.exp(-(dists**2) / (2.0 * sigma_s**2))
+    W *= conf[nbr_idx]   # neighbor's confidence
+
+    w_self = self_weight * conf
+    denom = np.maximum(w_self + W.sum(axis=1), 1e-12)
+
+    z_neighbors = (W[..., None] * logits[nbr_idx]).sum(axis=1)
+    z_self = (w_self[:, None] * logits)
+
+    z_out = (z_self + z_neighbors) / denom[:, None]
+    return z_out
+
+def row_softmax(Z):
+    Z = Z.astype(np.float64, copy=True)
+    Z -= Z.max(axis=1, keepdims=True)
+    np.exp(Z, out=Z)
+    Z /= Z.sum(axis=1, keepdims=True)
+    return Z
+
+def contrast_palette2(
+    labels,
+    s_range=(0.55, 0.95),
+    v_range=(0.65, 1.0),
+    base_hue=0.13,
+    noise_label=-1,
+):
+    """
+    Create a high-contrast RGB palette for the given labels.
+
+    - labels: 1D array-like of label ids (e.g. DBSCAN labels)
+    - s_range: (min_s, max_s) saturation range
+    - v_range: (min_v, max_v) value/brightness range
+    - base_hue: starting hue in [0, 1]
+    - noise_label: label id to paint as gray (e.g. -1 for DBSCAN)
+    """
+    labels = np.asarray(labels)
+    uniq = np.unique(labels)
+
+    # Separate noise label (if present) so it gets a fixed gray color
+    has_noise = noise_label in uniq
+    if has_noise:
+        class_labels = [l for l in uniq if l != noise_label]
+    else:
+        class_labels = uniq.tolist()
+
+    n_classes = max(1, len(class_labels))
+    phi = 0.6180339887498949  # golden ratio conjugate
+
+    # Pre-allocate output table in *input* label order
+    table = np.zeros((len(labels), 3), dtype=np.float32)
+
+    # Make a mapping: label -> (index in class_labels) so colors are stable
+    label_to_idx = {lab: i for i, lab in enumerate(class_labels)}
+
+    # Small pattern of (s, v) combinations to boost local contrast
+    # neighbors will differ in both hue AND (s, v)
+    sv_patterns = [
+        (s_range[1], v_range[1]),  # bright & saturated
+        (s_range[1], v_range[0]),  # saturated but darker
+        (s_range[0], v_range[1]),  # bright but less saturated
+        (s_range[0], v_range[0]),  # darker and less saturated
+    ]
+
+    # First assign colors for all non-noise labels
+    for idx, lab in enumerate(class_labels):
+        k = label_to_idx[lab]
+
+        # 1) Hue using golden ratio sequence (good global separation)
+        h = (base_hue + k * phi) % 1.0
+
+        # 2) Saturation + value: cycle through sv_patterns for local contrast
+        s, v = sv_patterns[k % len(sv_patterns)]
+
+        r, g, b = colorsys.hsv_to_rgb(h, s, v)
+
+        # Set this color for all entries with label == lab
+        table[labels == lab] = (r, g, b)
+
+    # Now handle noise label as mid-gray (or tweak as you like)
+    if has_noise:
+        gray = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+        table[labels == noise_label] = gray
+
+    if np.any(np.asarray(labels) == -1):
+        table[102] = (0.6, 0.6, 0.6)
+
+    return table
+
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background, mesh_type="mcube"):
     if mesh_type == "poisson":        
@@ -119,12 +245,20 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
                 print("sem_logits shape:", gaussians._sem_logits.shape)
             else:
                 print("_sem_logits is None")
-            Pi = gaussians.get_sem_probs()              # [N_anchor, K], softmaxed
-            cls_idx = Pi.argmax(dim=1).cpu().numpy()    
+
+            anchor_xyz = gaussians.get_anchor.detach().cpu().numpy()
+            logits = gaussians._sem_logits.detach().cpu().numpy()
+            smoothed_logits = weighted_logit_mean(anchor_xyz, logits)
+            # Pi = gaussians.get_sem_probs()              # [N_anchor, K], softmaxed
+            Pi = row_softmax(smoothed_logits)
+            cls_idx = np.full(Pi.shape[0], -1, int)
+            mask_conf = Pi.max(axis=1) >= 0.5   # shape (N,)
+            
+            cls_idx[mask_conf] = Pi[mask_conf].argmax(axis=1)
         
         anchor_xyz = gaussians.get_anchor.detach().cpu().numpy()
         classes = get_classes()                         # same list used when you constructed GaussianModel
-        palette = palette_from_classes(classes)         # [K,3] floats in [0,1]
+        palette = contrast_palette2(classes)         # [K,3] floats in [0,1]
         anchor_colors = palette[cls_idx] 
         
 
@@ -160,10 +294,10 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         mesh.vertex_colors = o3d.utility.Vector3dVector(v_colors.astype(np.float64))
         # print("verts:", len(mesh.vertices), "colors:", len(mesh.vertex_colors))
         # Write the mesh to a file, including vertex colors
-        o3d.io.write_triangle_mesh(os.path.join(model_path, "semantic_mesh_poisson_{}".format(iteration)+ ".ply"), mesh, write_vertex_colors=True)
+        o3d.io.write_triangle_mesh(os.path.join(model_path, "semantic_mesh_poisson_smoothed_{}".format(iteration)+ ".ply"), mesh, write_vertex_colors=True)
 
 
-        o3d.io.write_triangle_mesh(os.path.join(model_path, "extracted_mesh_poisson_{}".format(iteration)+ ".ply"), mesh)        
+        # o3d.io.write_triangle_mesh(os.path.join(model_path, "extracted_mesh_poisson_{}".format(iteration)+ ".ply"), mesh)        
     elif mesh_type == "mcube":
         _ = get_surface_trace(
             path = os.path.join(model_path, "extracted_mesh_marching_cube_{}".format(iteration)+".ply"),

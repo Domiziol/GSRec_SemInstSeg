@@ -15,15 +15,10 @@ import json
 from sklearn.cluster import DBSCAN, Birch, OPTICS
 from sklearn.neighbors import KDTree, NearestNeighbors
 import scipy.special as sp
-from scipy.spatial.distance import jensenshannon, pdist
+from scipy.spatial.distance import jensenshannon, pdist, cosine
+from sklearn.metrics.pairwise import cosine_distances
 from scipy.sparse import csr_matrix
 import open3d as o3d
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-
-
 
 def get_classes():
     classes= []
@@ -164,12 +159,8 @@ def palette_from_labels(labels, s=0.65, v=0.95):
         table[i] = (r, g, b)
     return table
 
-def contrast_palette(labels, s=0.85, v=0.98, noise_gray=0.00):
-    """
-    Drop-in replacement: returns an (L,3) RGB table in [0,1],
-    with well-separated hues. If -1 is among `labels`, the first
-    entry (index 0 after np.unique) is set to gray for noise.
-    """
+def contrast_palette(labels, s=0.85, v=0.98):
+    
     l = len(labels)
     n = max(1, l)
     table = np.zeros((l, 3), dtype=np.float32)
@@ -184,12 +175,75 @@ def contrast_palette(labels, s=0.85, v=0.98, noise_gray=0.00):
         r, g, b = colorsys.hsv_to_rgb(h, s, vv)
         table[i] = (r, g, b)
 
-    # If labels contain -1, np.unique(labels) puts it at index 0.
-    # Color that entry gray so noise is subdued.
-    if np.any(np.asarray(labels) == -1):
-        table[0] = (noise_gray, noise_gray, noise_gray)
 
     return table
+
+def contrast_palette2(
+    labels,
+    s_range=(0.55, 0.95),
+    v_range=(0.65, 1.0),
+    base_hue=0.13,
+    noise_label=-1,
+):
+    """
+    Create a high-contrast RGB palette for the given labels.
+
+    - labels: 1D array-like of label ids (e.g. DBSCAN labels)
+    - s_range: (min_s, max_s) saturation range
+    - v_range: (min_v, max_v) value/brightness range
+    - base_hue: starting hue in [0, 1]
+    - noise_label: label id to paint as gray (e.g. -1 for DBSCAN)
+    """
+    labels = np.asarray(labels)
+    uniq = np.unique(labels)
+
+    # Separate noise label (if present) so it gets a fixed gray color
+    has_noise = noise_label in uniq
+    if has_noise:
+        class_labels = [l for l in uniq if l != noise_label]
+    else:
+        class_labels = uniq.tolist()
+
+    n_classes = max(1, len(class_labels))
+    phi = 0.6180339887498949  # golden ratio conjugate
+
+    # Pre-allocate output table in *input* label order
+    table = np.zeros((len(labels), 3), dtype=np.float32)
+
+    # Make a mapping: label -> (index in class_labels) so colors are stable
+    label_to_idx = {lab: i for i, lab in enumerate(class_labels)}
+
+    # Small pattern of (s, v) combinations to boost local contrast
+    # neighbors will differ in both hue AND (s, v)
+    sv_patterns = [
+        (s_range[1], v_range[1]),  # bright & saturated
+        (s_range[1], v_range[0]),  # saturated but darker
+        (s_range[0], v_range[1]),  # bright but less saturated
+        (s_range[0], v_range[0]),  # darker and less saturated
+    ]
+
+    # First assign colors for all non-noise labels
+    for idx, lab in enumerate(class_labels):
+        k = label_to_idx[lab]
+
+        # 1) Hue using golden ratio sequence (good global separation)
+        h = (base_hue + k * phi) % 1.0
+
+        # 2) Saturation + value: cycle through sv_patterns for local contrast
+        s, v = sv_patterns[k % len(sv_patterns)]
+
+        r, g, b = colorsys.hsv_to_rgb(h, s, v)
+
+        # Set this color for all entries with label == lab
+        table[labels == lab] = (r, g, b)
+
+    # Now handle noise label as mid-gray (or tweak as you like)
+    if has_noise:
+        gray = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+        table[labels == noise_label] = gray
+
+    return table
+
 
 def generate_sam_data_for_anchors(anchor_points, all_views, files_path, anchor_ids = None):
     N = anchor_points.shape[0]
@@ -227,15 +281,60 @@ def generate_sam_data_for_anchors(anchor_points, all_views, files_path, anchor_i
 
     return projection_data
 
-# def signed_margin_loss(e, i_idx, j_idx, t, m=1.0, alpha=10.0, eps=1e-8):
-#     diff = e[i_idx] - e[j_idx]                 # (P, D)
-#     d = (diff.square().sum(dim=-1) + eps).sqrt()  # (P,)
-#     logits = -alpha * t * (d - m)
-#     return torch.nn.functional.softplus(logits).mean()
+def weighted_logit_mean(
+    anchors_xyz,
+    logits,
+    k=50,
+    self_weight=1.0,
+    use_entropy=True,
+    alpha=0.5):
 
-# def get_embeddings(indices: torch.Tensor):
-#     e = emb_table(indices)
-#     return F.normalize(e, p=2, dim=-1)
+    N, K = logits.shape
+
+    idx_sorted = np.argsort(logits, axis=1)
+    top1 = logits[np.arange(N), idx_sorted[:, -1]]
+    top2 = logits[np.arange(N), idx_sorted[:, -2]]
+    margin = top1 - top2
+    conf_margin = 1.0 / (1.0 + np.exp(-margin / 2.0))
+
+    if use_entropy:
+        z = logits - logits.max(axis=1, keepdims=True)
+        ez = np.exp(z)
+        sum_ez = ez.sum(axis=1, keepdims=True)
+        P = ez / np.clip(sum_ez, 1e-12, None)
+        # H = -sum p*log p
+        H = -(P * np.log(np.clip(P, 1e-12, 1.0))).sum(axis=1)
+        Hmax = np.log(K)
+        conf_entropy = 1.0 - H / (Hmax + 1e-12)
+        
+        conf = alpha * conf_entropy + (1.0 - alpha) * conf_margin
+    else:
+        conf = conf_margin
+
+    nn = NearestNeighbors(n_neighbors=min(k, N)).fit(anchors_xyz)
+    dists, nbr_idx = nn.kneighbors(anchors_xyz, return_distance=True)
+
+    nz = dists[dists > 0]
+    sigma_s = (np.median(nz) if nz.size else 1.0) + 1e-9
+
+    W = np.exp(-(dists**2) / (2.0 * sigma_s**2))
+    W *= conf[nbr_idx]   # neighbor's confidence
+
+    w_self = self_weight * conf
+    denom = np.maximum(w_self + W.sum(axis=1), 1e-12)
+
+    z_neighbors = (W[..., None] * logits[nbr_idx]).sum(axis=1)
+    z_self = (w_self[:, None] * logits)
+
+    z_out = (z_self + z_neighbors) / denom[:, None]
+    return z_out
+
+def row_softmax(Z):
+    Z = Z.astype(np.float64, copy=True)
+    Z -= Z.max(axis=1, keepdims=True)
+    np.exp(Z, out=Z)
+    Z /= Z.sum(axis=1, keepdims=True)
+    return Z
 
 if __name__ == "__main__":
     # Set up command line argument parser with default parameters
@@ -252,15 +351,15 @@ if __name__ == "__main__":
     files_path = "./data/replica/scan1/masks_real2/"
 
 
-    # Initialize system state (RNG) -- what is that ????
-    safe_state(args.quiet)
-
     gaussianModel, scene, anchor_points, sem_logits = setup_gaussian_scene_and_model(
         model.extract(args), 
         args.iteration,
         args.checkpoint_path
         )
     logits = sem_logits.cpu().detach().numpy()
+    smoothed_logits = weighted_logit_mean(anchor_points, logits)
+    
+
     anchor_id = np.arange(anchor_points.shape[0])
 
     bg_color = [1,1,1] if model._white_background else [0, 0, 0]
@@ -274,153 +373,73 @@ if __name__ == "__main__":
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
 
-    # projection_data = generate_sam_data_for_anchors(anchor_points, all_views, files_path, anchor_id)
+    #projection_data = generate_sam_data_for_anchors(anchor_points, all_views, files_path, anchor_id)
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(anchor_points)
     print("Before: ", len(pcd.points))
-    voxel_size = 0.04
-    # newpcd = pcd.voxel_down_sample(voxel_size = 0.13)   # 1060 points for vs = 0.13
-    # newpcd = pcd.voxel_down_sample(voxel_size = voxel_size)   # 1060 points for vs = 0.13
 
-    newpcd2, _, voxel_indices = pcd.voxel_down_sample_and_trace(
+    voxel_size = 0.04 
+     
+
+    newpcd, _, voxel_indices = pcd.voxel_down_sample_and_trace(
     voxel_size, min_bound = pcd.get_min_bound(), max_bound = pcd.get_max_bound(), approximate_class=False)
+    print(" After: ", len(newpcd.points))
 
-    print(" After: ", len(newpcd2.points))
-
-    anchors_downsampled = np.asarray(newpcd2.points)
-    steps = 200
-
-    # === Training part === 
+    anchors_downsampled = np.asarray(newpcd.points)
+    counts = np.array([len(points) for points in voxel_indices], dtype=float)
     anchors_downsampled_id = np.arange(anchors_downsampled.shape[0])
-    projection_data = generate_sam_data_for_anchors(anchors_downsampled, all_views, files_path, anchors_downsampled_id)
+
+
+    labels = np.load("inst_v2/dist+emb+sem_combined/weights_only/labels.npy")
+
+    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+    n_noise = int((labels == -1).sum())
+    print(f"{n_clusters=}, {n_noise=}")
 
     
-    proj = torch.from_numpy(projection_data).long()
-    N, V = proj.shape
 
-    views_pairs = []
-    views_point_matches = []
-    for v in range(V):
-        labels_v = proj[:, v]
-        # convert to: 0 = not present, 1.. = local mask id+1
-        view_segment = torch.where(labels_v == -1, torch.zeros_like(labels_v), labels_v + 1)
+    palette = contrast_palette2(np.unique(labels))
+    anchors_colors = palette[labels]
 
-        view_points = torch.nonzero(view_segment, as_tuple=False).squeeze(1)   # indices visible in this view
-        if view_points.numel() < 2:
-            continue
-
-        view_pairs = torch.combinations(view_points, r=2)
-        pair_labels = view_segment[view_pairs]
-        view_point_matches = (pair_labels[:, 0] == pair_labels[:, 1]).float()*2 - 1
-
-        views_pairs.append(view_pairs)
-        views_point_matches.append(view_point_matches)
-
-    device = 'cuda'
-    D = 5
-
-    embeddings = nn.Embedding(num_embeddings=anchors_downsampled.shape[0], embedding_dim=D, sparse=False)
-    optimizer = torch.optim.Adam(embeddings.parameters(), lr=0.1)
-
-    # Optimization
-    for step in range(steps):
-        losses = []
-        for view_pairs, view_point_matches in zip(views_pairs, views_point_matches):
-            view_embedding_pairs = nn.functional.normalize(embeddings(view_pairs), dim=2) # and this is what?
-            view_embedding_sqdists = (view_embedding_pairs[:,0,:] - view_embedding_pairs[:,1,:]).square().sum(dim=1) # what are those indexes :,0,:?
-            loss = torch.dot(view_point_matches, view_embedding_sqdists)
-            losses.append(loss)        
-            #print(torch.cat((view_pairs, torch.unsqueeze(view_point_matches,1)),1))
-        
-        # Optimization step
-        total_loss = torch.stack(losses).sum()
-        optimizer.zero_grad()
-        total_loss.backward()
-        optimizer.step()
-        
-        #print(total_loss)
-
-    # Results    
-    embds = nn.functional.normalize(embeddings.weight, dim=1).detach().cpu().numpy()
-
-    print("total loss", total_loss)
-    np.save(f"embeddings_norm_{voxel_size}_{steps}_withtrace.npy", embds)
-    # === End of training ===
+    # make noise a neutral gray (optional)
+    noise = (labels == -1)
+    if noise.any():
+        anchors_colors[noise] = np.array([0, 0, 0], dtype=np.float64)
 
 
-    # restore (later)
-    # embds = np.load(f"embeddings_norm_{voxel_size}_{steps}.npy")
-    
-    
+    all_views = get_views(scene, skip_train=args.skip_train, skip_test = args.skip_test)
 
-    # eps = 0.004
-    # min_samples = 5
-    # db = DBSCAN(
-    #     eps=eps,
-    #     min_samples=min_samples,
-    #     metric='cosine',
-    #     algorithm="auto",
-    # )
-    # labels = db.fit_predict(embds)
-    
-    # # ===
+    points, color, opaicity,scaling,rot, normal, _, _, _,_ = generate_neural_gaussians_SDF(all_views[0], gaussianModel, visible_mask=None)
+    points = points.cpu().detach().numpy()
+    points_normals = torch.nn.functional.normalize(normal).cpu().detach().numpy()
+    vertices, triangle, pcd = poisson_surface_reconstruction(points, points_normals, 8) # 9
 
-    # n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-    # n_noise = int((labels == -1).sum())
-    # print(f"{n_clusters=}, {n_noise=}")
+    scale_matrix = np.diag([4, 4, 4])
+    shift_vector = np.array([2.95531, 1.13268, -0.058562])
 
-    # palette = contrast_palette(np.unique(labels))
+    anchor_points_scaled = anchor_points * 4 + shift_vector[None, :]
+    import open3d as o3d
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(np.matmul(scale_matrix, np.asarray(vertices).T).T)
+    verts_aligned = mesh.vertices + shift_vector[None, :]  # dodajemy przesunięcie
+    mesh.vertices = o3d.utility.Vector3dVector(verts_aligned)
 
-    # N = len(anchor_points)
-    # labels_dense = -np.ones(N, dtype=int)
-    # for i, idxs in enumerate(voxel_indices):
-    #     labels_dense[idxs] = labels[i]
-
-    # anchors_colors = palette[labels]
-    # all_views = get_views(scene, skip_train=args.skip_train, skip_test = args.skip_test)
-
-    # # make noise a neutral gray (optional)
-    # # noise = (labels == -1)
-    # # if noise.any():
-    # #     anchors_colors[noise] = np.array([0, 0, 0], dtype=np.float64)
-
-    # # assign to your downsampled cloud (embeddings were for anchors_downsampled)
-    # # newpcd.colors = o3d.utility.Vector3dVector(anchors_colors)
-
-    # # view
-    # # o3d.visualization.draw_geometries([newpcd])
-
-    # points, color, opaicity,scaling,rot, normal, _, _, _,_ = generate_neural_gaussians_SDF(all_views[0], gaussianModel, visible_mask=None)
-    # points = points.cpu().detach().numpy()
-    # points_normals = torch.nn.functional.normalize(normal).cpu().detach().numpy()
-    # vertices, triangle, pcd2 = poisson_surface_reconstruction(points, points_normals, 8) # 9
-    # import open3d as o3d
-    # mesh = o3d.geometry.TriangleMesh()
-    # mesh.vertices = o3d.utility.Vector3dVector(vertices)
-    # mesh.triangles = o3d.utility.Vector3iVector(triangle)
-    # mesh.vertex_normals = o3d.utility.Vector3dVector(points_normals)
+    mesh.triangles = o3d.utility.Vector3iVector(triangle)
+    mesh.vertex_normals = o3d.utility.Vector3dVector(points_normals)
     # scale_matrix = np.diag([50, 50, 50])
-    # pcd2.points = o3d.utility.Vector3dVector(np.matmul(scale_matrix, np.asarray(pcd2.points).T).T)
-    # normals = np.asarray(pcd2.normals)
-    # scaled_normals =normals * 0.1
-    # pcd2.normals = o3d.utility.Vector3dVector(scaled_normals)
-    # # o3d.visualization.draw_geometries([pcd], point_show_normal=True)
-    # # mesh.compute_vertex_normals()
+    pcd.points = o3d.utility.Vector3dVector(np.matmul(scale_matrix, np.asarray(pcd.points).T).T)
+    normals = np.asarray(pcd.normals)
+    scaled_normals =normals * 0.1
+    pcd.normals = o3d.utility.Vector3dVector(scaled_normals)
+    # o3d.visualization.draw_geometries([pcd], point_show_normal=True)
+    # mesh.compute_vertex_normals()
     
-    # from scipy.spatial import cKDTree
-    # kdtree = cKDTree(anchors_downsampled)
-    # verts = np.asarray(mesh.vertices)
-    # _, idx = kdtree.query(verts, k=1) 
+    from scipy.spatial import cKDTree
+    kdtree = cKDTree(anchor_points_scaled)
+    verts = np.asarray(mesh.vertices)
+    _, idx = kdtree.query(verts, k=1) 
+    v_colors = anchors_colors[idx] 
+    mesh.vertex_colors = o3d.utility.Vector3dVector(v_colors.astype(np.float64))
 
-    
-    # v_colors = anchors_colors[idx]
-    # vc = v_colors.mean(axis=1)
-    # print(np.shape(mesh.vertices), np.shape(v_colors))
-    # mesh.vertex_colors = o3d.utility.Vector3dVector(v_colors.astype(np.float64))
-    
-    # o3d.io.write_triangle_mesh(f"testy_embed/test1.ply", mesh, write_vertex_colors=True)
-    
-
-
-
+    o3d.io.write_triangle_mesh(f"inst_v2/dist+emb+sem_combined/weights_only/test2.ply", mesh, write_vertex_colors=True)

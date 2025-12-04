@@ -126,9 +126,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     if not hasattr(opt, "lambda_sem"):
         opt.lambda_sem = 0.0
 
-    SEM_DELAY  = 2000    # keep semantics off while geometry forms
+    SEM_DELAY  = 8000    # keep semantics off while geometry forms
+    # SEM_DELAY  = 0 
     SEM_WARMUP = 6000    # linearly ramp over 3k iters
-    SEM_TARGET = 0.05
+    SEM_TARGET = 0.1
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -189,7 +190,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
         # Load masks for image (SAM+CLIP)
-        samclip_path = "./data/replica/scan1/masks_real2/"
+        # samclip_path = "./data/replica/scan1/masks_real2/"
+        samclip_path = "./data/kitchen_static/masks_test3/"
         image_name = viewpoint_cam.image_name
         base = os.path.splitext(image_name)[0]
         npz_path = os.path.join(samclip_path, f"{base}.npz")
@@ -440,7 +442,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, dataset_name, iteration, Ll1, loss, sdf_loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger)
+            # training_report(tb_writer, dataset_name, iteration, Ll1, loss, sdf_loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger)
             if (iteration in saving_iterations):
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -794,10 +796,10 @@ if __name__ == "__main__":
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
-    try:
-        saveRuntimeCode(os.path.join(args.model_path))
-    except:
-        print('save code failed')
+    # try:
+    #     saveRuntimeCode(os.path.join(args.model_path))
+    # except:
+    #     print('save code failed')
     
     # enable logging
     

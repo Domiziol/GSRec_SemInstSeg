@@ -328,6 +328,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
         N_vis_anchors = anchor_idx_visible.numel()
         
+        xyz_sem = xyz.detach()
+        screenspace_sem = screenspace_points.detach()
+        normal_sem = normal.detach()
+        opacity_sem = opacity.detach()
+        scaling_sem = scaling.detach()
+        rot_sem = rot.detach()
 
         # For each visible anchor, repeat its index n_offsets times to match flattened offsets:
         owner_idx_full = anchor_idx_visible.repeat_interleave(pc.n_offsets)               # [N_visible_anchors * n_offsets]
@@ -347,15 +353,26 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         def render_scalar_field_as_image(x_scalar_per_gaussian: torch.Tensor) -> torch.Tensor:
             # uses probabilities  as a 'color' input to rasterizer 
             colors_precomp_x = x_scalar_per_gaussian.expand(-1, 3).contiguous()
+            # color_x, _, _, _, _ = rasterizer(
+            #     means3D = xyz,
+            #     means2D = screenspace_points,
+            #     shs = None,
+            #     colors_precomp = colors_precomp_x,  
+            #     normal_precomp = pc.normal_activation(normal),
+            #     opacities = opacity,
+            #     scales = scaling,
+            #     rotations = rot,
+            #     cov3D_precomp = None
+            # )
             color_x, _, _, _, _ = rasterizer(
-                means3D = xyz,
-                means2D = screenspace_points,
+                means3D = xyz_sem,
+                means2D = screenspace_sem,
                 shs = None,
                 colors_precomp = colors_precomp_x,  
-                normal_precomp = pc.normal_activation(normal),
-                opacities = opacity,
-                scales = scaling,
-                rotations = rot,
+                normal_precomp = pc.normal_activation(normal_sem),
+                opacities = opacity_sem,
+                scales = scaling_sem,
+                rotations = rot_sem,
                 cov3D_precomp = None
             )
             

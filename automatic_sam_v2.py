@@ -340,9 +340,41 @@ def save_mask_crops(img_pil, masks_bool, labels_idx, scores, classes, crops_dir,
         fname = f"mask_{j:03d}_{cls_name}_{sc:.2f}.png"
         crop.save(crops_dir / fname)
 
+
+def overlay_sam_masks(image, masks, alpha=0.5, out_path="masks_overlay.png"):
+    
+    if isinstance(masks, list):
+        masks_arr = np.stack(masks, axis=0)  # (N, H, W)
+    else:
+        masks_arr = masks  # assume already (N, H, W)
+
+    overlay = image.copy().astype(np.float32)
+
+    H, W = image.shape[:2]
+    N = masks_arr.shape[0]
+
+    # random colors for each mask
+    colors = np.random.randint(0, 255, size=(N, 3), dtype=np.uint8)
+
+    for i in range(N):
+        mask = masks_arr[i]
+        color = colors[i]
+
+        # broadcast color to image shape
+        color_img = np.zeros_like(overlay)
+        color_img[mask] = color
+
+        # alpha blend where mask is True
+        overlay[mask] = (1 - alpha) * overlay[mask] + alpha * color_img[mask]
+
+    overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+    cv2.imwrite(out_path, overlay[:, :, ::-1])
+
+
 def preprocess_images_main_test():
-    input_path = "./data/replica/scan1/images/"
-    output_path = "./data/replica/scan1/masks_test3"
+    input_path = "./data/kitchen_static/colmap_my/rgb_images/"
+    output_path = "./data/kitchen_static/masks_test3/"
+    sam_masks_output_path = "./data/replica/scan1/masksonly1/"
     Path(output_path).mkdir(parents=True, exist_ok=True)
     vis_dir = Path(output_path) / "vis"
     vis_dir.mkdir(parents=True, exist_ok=True)
@@ -392,34 +424,37 @@ def preprocess_images_main_test():
         else:
             masks_bool = np.stack(masks_bool, axis=0)
 
+        # name = stem + ".jpg"
+        # overlay_sam_masks(img_np, masks_bool, alpha=0.5, out_path=os.path.join(sam_masks_output_path,name))
+
         
         labels_idx = []
         scores = []
         for j in range(masks_bool.shape[0]):
             m = masks_bool[j]
             # crop masked region
-            rows, cols = np.nonzero(m)
-            y0, y1 = rows.min(), rows.max()+1
-            x0, x1 = cols.min(), cols.max()+1
-            crop_rgb = img_np[y0:y1, x0:x1].copy()
-            local = m[y0:y1, x0:x1]
-            crop_rgb = np.where(local[..., None], crop_rgb, 0)
-            crop_pil = Image.fromarray(crop_rgb)
             # rows, cols = np.nonzero(m)
-
-            # y0, y1 = rows.min(), rows.max() + 1
-            # x0, x1 = cols.min(), cols.max() + 1
-
-            # margin_y = max(2, int(0.10 * (y1 - y0)))
-            # margin_x = max(2, int(0.10 * (x1 - x0)))
-
-            # y0 = max(0, y0 - margin_y)
-            # y1 = min(H0, y1 + margin_y)
-            # x0 = max(0, x0 - margin_x)
-            # x1 = min(W0, x1 + margin_x)
-
-            # crop_rgb = np.array(img_pil)[y0:y1, x0:x1].copy()
+            # y0, y1 = rows.min(), rows.max()+1
+            # x0, x1 = cols.min(), cols.max()+1
+            # crop_rgb = img_np[y0:y1, x0:x1].copy()
+            # local = m[y0:y1, x0:x1]
+            # crop_rgb = np.where(local[..., None], crop_rgb, 0)
             # crop_pil = Image.fromarray(crop_rgb)
+            rows, cols = np.nonzero(m)
+
+            y0, y1 = rows.min(), rows.max() + 1
+            x0, x1 = cols.min(), cols.max() + 1
+
+            margin_y = max(2, int(0.10 * (y1 - y0)))
+            margin_x = max(2, int(0.10 * (x1 - x0)))
+
+            y0 = max(0, y0 - margin_y)
+            y1 = min(H0, y1 + margin_y)
+            x0 = max(0, x0 - margin_x)
+            x1 = min(W0, x1 + margin_x)
+
+            crop_rgb = np.array(img_pil)[y0:y1, x0:x1].copy()
+            crop_pil = Image.fromarray(crop_rgb)
 
             top_classes, top_scores = topk_clip_for_crop(
                 crop_pil, clip_model, clip_preprocess, text_feat, classes, k=1
