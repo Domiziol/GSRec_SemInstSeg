@@ -336,6 +336,26 @@ def row_softmax(Z):
     Z /= Z.sum(axis=1, keepdims=True)
     return Z
 
+def apply_full_transform(points: np.ndarray) -> np.ndarray:
+    scale_matrix = np.diag([4, 4, 4])
+    scale_factor = 4
+    shift_vector = np.array([2.95531, 1.13268, -0.058562])
+
+    transform = np.array([
+        [ 1.06030165e+00, -3.20324289e-03,  7.84449640e-04, -1.23199711e-01],
+        [ 3.20130877e-03,  1.06029875e+00, 2.60242687e-03, -4.07212017e-02],
+        [-7.92305771e-04, -2.60004585e-03,  1.06030329e+00, -6.42458858e-02],
+        [ 0.00000000e+00,  0.00000000e+00,  0.00000000e+00,  1.00000000e+00],
+    ])
+
+    # 1) skala + przesunięcie
+    pts = points * scale_factor + shift_vector[None, :]   # (N, 3)
+    # 2) przejście do współrzędnych jednorodnych
+    pts_h = np.concatenate([pts, np.ones((pts.shape[0], 1))], axis=1)  # (N, 4)
+    # 3) zastosowanie macierzy 4x4
+    pts_tf = (transform @ pts_h.T).T[:, :3]  # z powrotem (N, 3)
+    return pts_tf
+
 if __name__ == "__main__":
     # Set up command line argument parser with default parameters
     parser = ArgumentParser(description="Testing script parameters")
@@ -415,31 +435,24 @@ if __name__ == "__main__":
     points_normals = torch.nn.functional.normalize(normal).cpu().detach().numpy()
     vertices, triangle, pcd = poisson_surface_reconstruction(points, points_normals, 8) # 9
 
-    scale_matrix = np.diag([4, 4, 4])
-    shift_vector = np.array([2.95531, 1.13268, -0.058562])
-
-    anchor_points_scaled = anchor_points * 4 + shift_vector[None, :]
+    
+    anchor_points_transformed = apply_full_transform(anchor_points)
     import open3d as o3d
     mesh = o3d.geometry.TriangleMesh()
-    mesh.vertices = o3d.utility.Vector3dVector(np.matmul(scale_matrix, np.asarray(vertices).T).T)
-    verts_aligned = mesh.vertices + shift_vector[None, :]  # dodajemy przesunięcie
-    mesh.vertices = o3d.utility.Vector3dVector(verts_aligned)
+
+    verts_transformed = apply_full_transform(vertices)
+    mesh.vertices = o3d.utility.Vector3dVector(verts_transformed)
 
     mesh.triangles = o3d.utility.Vector3iVector(triangle)
     mesh.vertex_normals = o3d.utility.Vector3dVector(points_normals)
-    # scale_matrix = np.diag([50, 50, 50])
-    pcd.points = o3d.utility.Vector3dVector(np.matmul(scale_matrix, np.asarray(pcd.points).T).T)
-    normals = np.asarray(pcd.normals)
-    scaled_normals =normals * 0.1
-    pcd.normals = o3d.utility.Vector3dVector(scaled_normals)
-    # o3d.visualization.draw_geometries([pcd], point_show_normal=True)
-    # mesh.compute_vertex_normals()
+    
     
     from scipy.spatial import cKDTree
-    kdtree = cKDTree(anchor_points_scaled)
+    
+    kdtree = cKDTree(anchor_points_transformed)
     verts = np.asarray(mesh.vertices)
     _, idx = kdtree.query(verts, k=1) 
     v_colors = anchors_colors[idx] 
     mesh.vertex_colors = o3d.utility.Vector3dVector(v_colors.astype(np.float64))
 
-    o3d.io.write_triangle_mesh(f"inst_v2/dist+emb+sem_combined/weights_only/test2.ply", mesh, write_vertex_colors=True)
+    o3d.io.write_triangle_mesh(f"inst_v2/dist+emb+sem_combined/weights_only/test3.ply", mesh, write_vertex_colors=True)
