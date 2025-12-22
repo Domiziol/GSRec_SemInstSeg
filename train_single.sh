@@ -1,7 +1,7 @@
 #!/bin/bash
 python train.py\
     --gpu 0\
-    -s ./data/kitchen_static/colmap_my/ --voxel_size 0.001\
+    -s ./data/replica/scan1/ --voxel_size 0.001\
     --update_init_factor 16\
     --iterations 30000\
     --mlp_sdf_lr_init 0.0005\
@@ -13,4 +13,4 @@ python train.py\
     --sdf_inside_out\
     --eval\
     --sdf_start_iter 15000\
-    -m outputs/kitchen_v1
+    -m outputs/final_sam3/d8k_l01

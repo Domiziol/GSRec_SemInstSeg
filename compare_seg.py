@@ -14,7 +14,7 @@ import open3d as o3d
 import trimesh
 from scipy.spatial import cKDTree
 import colorsys
-from plyfile import PlyData
+from plyfile import PlyData, PlyElement
 from collections import defaultdict
 
 def get_classes():
@@ -269,7 +269,7 @@ def apply_full_transform(points: np.ndarray) -> np.ndarray:
 
    
 if __name__ == "__main__":
-    # Set up command line argument parser with default parameters
+     # Set up command line argument parser with default parameters
     parser = ArgumentParser(description="Testing script parameters")
     model = ModelParams(parser, sentinel=True)
     pipeline = PipelineParams(parser)
@@ -278,14 +278,11 @@ if __name__ == "__main__":
     parser.add_argument("--skip_train", default=False)
     parser.add_argument("--skip_test", default=False) # from True
     parser.add_argument("--checkpoint_path")
+    parser.add_argument("--class_id", default=3, type=int)
     args = get_combined_args(parser)
+    class_id = args.class_id
 
-    masks_path = "./data/replica/scan1/masks_real2/"
-    gt_mesh_path = "./data/replica/scan1/mesh_semantic_vert.ply"
-    gt_info_sem_path = "./data/replica/scan1/info_semantic.json"
-    pred_mesh_path = "./inst_v2/dist+emb+sem_combined/experiments/test2_with_classid.ply"
-
-
+    # == LOAD GAUSSIAN SCENE ==
     gaussianModel, scene, anchor_points, sem_logits = setup_gaussian_scene_and_model(
         model.extract(args), 
         args.iteration,
@@ -293,120 +290,164 @@ if __name__ == "__main__":
         )
     logits = sem_logits.cpu().detach().numpy()
     smoothed_logits = weighted_logit_mean(anchor_points, logits)
-    
-
     anchor_id = np.arange(anchor_points.shape[0])
-
     bg_color = [1,1,1] if model._white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-
     all_views = get_views(scene, skip_train=args.skip_train, skip_test = args.skip_test)
+    anchors_transformed = apply_full_transform(anchor_points)
 
-    pred_instance_id = np.load("./experiments2_fromsam3/model_d8k/wdist=0.0_wemb=1.0_wsem=0.0_pdist85_pemb78_psem70_512/instance_ids.npy")
+    Pi = row_softmax(smoothed_logits)
+    cls_idx = np.full(Pi.shape[0], -2, int)
+    mask_conf = Pi.max(axis=1) >= 0.1  # shape (N,)
+    cls_idx[mask_conf] = Pi[mask_conf].argmax(axis=1) + 1   # !!!
+    
 
-    n_clusters = len(set(pred_instance_id)) - (1 if -1 in pred_instance_id else 0)
-    n_noise = int((pred_instance_id == -1).sum())
-    print(f"{n_clusters=}, {n_noise=}")
+    choose_model = 8
 
-    anchor_points_transformed = apply_full_transform(anchor_points)
+    masks_path = "./data/replica/scan1/masks_real2/"
+    gt_mesh_path = "./data/replica/scan1/mesh_semantic_verts_bothids.ply"
+    gt_info_sem_path = "./data/replica/scan1/info_semantic.json"
+    # pred_mesh_path = f"./outputs/final_sam3/d8k_l01/both_segmentations.ply"
 
 
-    from replica_eval_struct import build_replica_scannet_structs, build_replica_structs_from_labeled_mesh
-    from replica_eval_metrics import evaluate_scannet_style, debug_full
+    # --- build output vertex dtype: keep all original fields, replace/add red/green/blue ---
+    ply = PlyData.read(gt_mesh_path)
 
-    verts, gt, pred = build_replica_scannet_structs(
-        gt_mesh_path=gt_mesh_path,
-        info_json_path=gt_info_sem_path,
-        anchor_points_transformed=anchor_points_transformed,
-        smoothed_logits=smoothed_logits,
-        pred_cluster_ids=pred_instance_id,
+    v = ply["vertex"].data
+    cls = v["class_id"].astype(np.int32)
+
+    # --- build output vertex dtype: keep all original fields, replace/add red/green/blue ---
+    drop = {"red", "green", "blue", "r", "g", "b"}
+    old_names = list(v.dtype.names)
+
+    base_dtype = [(n, v.dtype[n]) for n in old_names if n not in drop]
+    new_dtype = base_dtype + [("red", "u1"), ("green", "u1"), ("blue", "u1")]
+
+    v_new = np.empty(v.shape, dtype=new_dtype)
+
+    # copy original fields
+    for n in old_names:
+        if n in drop:
+            continue
+        v_new[n] = v[n]
+
+    # assign colors: class==TARGET -> white else black
+    mask = (cls == class_id)
+    col = np.zeros((len(cls), 3), dtype=np.uint8)
+    col[mask] = 255
+
+    v_new["red"]   = col[:, 0]
+    v_new["green"] = col[:, 1]
+    v_new["blue"]  = col[:, 2]
+
+    # replace vertex element, keep everything else (faces etc.) as-is
+    elements_out = [PlyElement.describe(v_new, "vertex")]
+    for e in ply.elements:
+        if e.name != "vertex":
+            elements_out.append(e)
+
+    PlyData(elements_out, text=ply.text).write(f"./semantics_comparison/test_gt_classid={class_id}.ply")
+
+
+    gt = PlyData.read(gt_mesh_path)["vertex"].data
+
+    gt_xyz = np.stack([gt["x"], gt["y"], gt["z"]], axis=1).astype(np.float32)
+    gt_cls = gt["class_id"].astype(np.int32)
+
+    pred_xyz = anchors_transformed.astype(np.float32)
+    pred_cls = cls_idx.astype(np.int32)
+
+    # --- map anchors (pred) -> gt vertices via nearest neighbor ---
+    tree = cKDTree(pred_xyz)
+    dists, nn_idx = tree.query(gt_xyz, k=1)
+
+    mapped_pred_cls = pred_cls[nn_idx]
+
+    gt_class   = (gt_cls == class_id)
+    pred_class = (mapped_pred_cls == class_id)
+
+    tp = gt_class & pred_class
+    fn = gt_class & (~pred_class)
+    fp = (~gt_class) & pred_class
+
+    # colors: TP=white, FN=red, FP=blue, else=black
+    r = np.zeros(len(gt_cls), dtype=np.uint8)
+    g = np.zeros(len(gt_cls), dtype=np.uint8)
+    b = np.zeros(len(gt_cls), dtype=np.uint8)
+
+    r[tp] = g[tp] = b[tp] = 255
+    r[fn] = 255
+    b[fp] = 255
+
+    # build a vertex array with RGB (keep all existing vertex fields)
+    from plyfile import PlyData, PlyElement
+    gt_ply = PlyData.read(gt_mesh_path)
+    v = gt_ply["vertex"].data
+    old_names = v.dtype.names
+
+    new_dtype = list(v.dtype.descr)
+    if "red" not in old_names:   new_dtype += [("red", "u1"), ("green", "u1"), ("blue", "u1")]
+    v2 = np.empty(v.shape, dtype=new_dtype)
+
+    for n in old_names:
+        v2[n] = v[n]
+    v2["red"], v2["green"], v2["blue"] = r, g, b
+
+    vertex_el = PlyElement.describe(v2, "vertex")
+
+    # replace the existing 'vertex' element while keeping all other elements (e.g., 'face')
+    new_elements = []
+    for el in gt_ply.elements:
+        if el.name == "vertex":
+            new_elements.append(vertex_el)
+        else:
+            new_elements.append(el)
+
+    # rebuild PlyData and write
+    out = PlyData(
+        new_elements,
+        text=gt_ply.text,
+        byte_order=gt_ply.byte_order,
+        comments=gt_ply.comments,
+        obj_info=gt_ply.obj_info,
     )
-    gt_labels = gt["label_ids"]
-    pred_labels = pred["label_ids"]
-
-    # print("GT unique labels:", np.unique(gt_labels[gt_labels != -1]))
-    # print("Pred unique labels:", np.unique(pred_labels))
-
-    print("GT vertices:", verts.shape[0])
-    print("GT instances:", len(gt["instances"]))
-    print("Pred instances:", len(pred["instances"]))
-
-    results = evaluate_scannet_style(gt, pred, iou_thresholds=(0.25, 0.5))
-
-    print("mIoU: {:.8f}".format(results["semantic"]["mIoU"]))
-    print("mAP@0.25: {:.8f}".format(results["instance"]["mAP"][0.25]))
-    print("mAP@0.5: {:.8f}".format(results["instance"]["mAP"][0.5]))
+    out.write(f"./semantics_comparison/test_mapping_classid={class_id}.ply")
 
 
+    # ply = PlyData.read(gt_mesh_path)
 
-    # verts, gt, pred = build_replica_structs_from_labeled_mesh(
-    #     gt_mesh_path=gt_mesh_path,
-    #     info_json_path=gt_info_sem_path,
-    #     pred_mesh_path=pred_mesh_path,
-    # )
+    # v = ply["vertex"].data
+    # cls = v["class_id"].astype(np.int32)
 
-    # print("GT vertices:", verts.shape[0])
-    # print("GT instances:", len(gt["instances"]))
-    # print("Pred instances:", len(pred["instances"]))
+    # # --- build output vertex dtype: keep all original fields, replace/add red/green/blue ---
+    # drop = {"red", "green", "blue", "r", "g", "b"}
+    # old_names = list(v.dtype.names)
 
-    # results = evaluate_scannet_style(gt, pred, iou_thresholds=(0.25, 0.5))
+    # base_dtype = [(n, v.dtype[n]) for n in old_names if n not in drop]
+    # new_dtype = base_dtype + [("red", "u1"), ("green", "u1"), ("blue", "u1")]
 
-    # print(f"mIoU: {results['semantic']['mIoU']:.8f}")
-    # for thr, v in results["instance"]["mAP"].items():
-    #     print(f"mAP@{thr}: {v:.8f}")
+    # v_new = np.empty(v.shape, dtype=new_dtype)
 
+    # # copy original fields
+    # for n in old_names:
+    #     if n in drop:
+    #         continue
+    #     v_new[n] = v[n]
 
-    results = debug_full(gt, pred,
-                     iou_thresholds=(0.25, 0.5),
-                     ignore_label=-1)
+    # # assign colors: class==TARGET -> white else black
+    # mask = (cls == class_id)
+    # col = np.zeros((len(cls), 3), dtype=np.uint8)
+    # col[mask] = 255
 
+    # v_new["red"]   = col[:, 0]
+    # v_new["green"] = col[:, 1]
+    # v_new["blue"]  = col[:, 2]
 
+    # # replace vertex element, keep everything else (faces etc.) as-is
+    # elements_out = [PlyElement.describe(v_new, "vertex")]
+    # for e in ply.elements:
+    #     if e.name != "vertex":
+    #         elements_out.append(e)
+
+    # PlyData(elements_out, text=ply.text).write(f"./semantics_comparison/test_pred_classid={class_id}.ply")
     
-
-
-
-
-
-
-
-
-
-
-
-
-
-    # === COLORING
-    # palette = contrast_palette2(np.unique(labels))
-    # anchors_colors = palette[labels]
-
-    # # make noise a neutral gray (optional)
-    # noise = (labels == -1)
-    # if noise.any():
-    #     anchors_colors[noise] = np.array([0.5, 0.5, 0.5], dtype=np.float64)
-
-
-    # points, color, opacity,scaling,rot, normal, _, _, _,_ = generate_neural_gaussians_SDF(all_views[0], gaussianModel, visible_mask=None)
-    # points = points.cpu().detach().numpy()
-    # points_normals = torch.nn.functional.normalize(normal).cpu().detach().numpy()
-    # vertices, triangle, pcd = poisson_surface_reconstruction(points, points_normals, 8) # 9
-
-    
-    
-  
-    # mesh = o3d.geometry.TriangleMesh()
-
-    # verts_transformed = apply_full_transform(vertices)
-    # mesh.vertices = o3d.utility.Vector3dVector(verts_transformed)
-
-    # mesh.triangles = o3d.utility.Vector3iVector(triangle)
-    # mesh.vertex_normals = o3d.utility.Vector3dVector(points_normals)
-    
-
-    
-    # kdtree = cKDTree(anchor_points_transformed)
-    # verts = np.asarray(mesh.vertices)
-    # _, idx = kdtree.query(verts, k=1) 
-    # v_colors = anchors_colors[idx] 
-    # mesh.vertex_colors = o3d.utility.Vector3dVector(v_colors.astype(np.float64))
-
-    # o3d.io.write_triangle_mesh(f"inst_v2/dist+emb+sem_combined/weights_only/test3.ply", mesh, write_vertex_colors=True)

@@ -26,7 +26,7 @@
                 "--sdf_inside_out",
                 "--eval",
                 "--sdf_start_iter=15000",
-                "-m=outputs/test1"
+                "-m=outputs/final/debug"
             ]
         },
         {
@@ -37,7 +37,8 @@
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
             "args": [
-                "--model_path=outputs/scan1v2_pd8"
+                "--model_path=outputs/final/d8000_l0.1_maskswithbackground_detached/",
+                "--checkpoint_path=outputs/final/d8000_l0.1_maskswithbackground_detached/chkpnt30000.pth"
             ]
         },
         {

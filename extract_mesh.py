@@ -96,8 +96,8 @@ def palette_from_classes(classes, s=0.65, v=0.95):
         r, g, b = colorsys.hsv_to_rgb(h, s, v)
         table[i] = (r, g, b)
 
-    if np.any(np.asarray(classes) == -1):
-        table[102] = (0.6, 0.6, 0.6)
+    # if np.any(np.asarray(classes) == -1):
+    #     table[102] = (0, 0, 0)
     return table 
 
 def get_classes():
@@ -158,6 +158,54 @@ def weighted_logit_mean(
 
     z_out = (z_self + z_neighbors) / denom[:, None]
     return z_out
+
+# def weighted_logit_mean(
+#     anchors_xyz,
+#     logits,
+#     k=50,
+#     self_weight=1.0,
+#     use_entropy=True,
+#     alpha=0.5):
+
+#     N, K = logits.shape
+
+#     idx_sorted = np.argsort(logits, axis=1)
+#     top1 = logits[np.arange(N), idx_sorted[:, -1]]
+#     top2 = logits[np.arange(N), idx_sorted[:, -2]]
+#     margin = top1 - top2
+#     conf_margin = 1.0 / (1.0 + np.exp(-margin / 2.0))
+
+#     if use_entropy:
+#         z = logits - logits.max(axis=1, keepdims=True)
+#         ez = np.exp(z)
+#         sum_ez = ez.sum(axis=1, keepdims=True)
+#         P = ez / np.clip(sum_ez, 1e-12, None)
+#         # H = -sum p*log p
+#         H = -(P * np.log(np.clip(P, 1e-12, 1.0))).sum(axis=1)
+#         Hmax = np.log(K)
+#         conf_entropy = 1.0 - H / (Hmax + 1e-12)
+        
+#         conf = alpha * conf_entropy + (1.0 - alpha) * conf_margin
+#     else:
+#         conf = conf_margin
+
+#     nn = NearestNeighbors(n_neighbors=min(k, N)).fit(anchors_xyz)
+#     dists, nbr_idx = nn.kneighbors(anchors_xyz, return_distance=True)
+
+#     nz = dists[dists > 0]
+#     sigma_s = (np.median(nz) if nz.size else 1.0) + 1e-9
+
+#     W = np.exp(-(dists**2) / (2.0 * sigma_s**2))
+#     W *= conf[nbr_idx]   # neighbor's confidence
+
+#     w_self = self_weight * conf
+#     denom = np.maximum(w_self + W.sum(axis=1), 1e-12)
+
+#     z_neighbors = (W[..., None] * logits[nbr_idx]).sum(axis=1)
+#     z_self = (w_self[:, None] * logits)
+
+#     z_out = (z_self + z_neighbors) / denom[:, None]
+#     return z_out
 
 def row_softmax(Z):
     Z = Z.astype(np.float64, copy=True)
@@ -238,29 +286,54 @@ def contrast_palette2(
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background, mesh_type="mcube"):
     if mesh_type == "poisson":        
-        points, color, opaicity,scaling,rot, normal, _, _, _,_ = generate_neural_gaussians_SDF(views[0], gaussians, visible_mask=None)
+        points, color, opaicity,scaling,rot, normal, _, _, _,anchor_from_gaussian = generate_neural_gaussians_SDF(views[0], gaussians, visible_mask=None)
         with torch.no_grad():
             print("anchor:", gaussians.get_anchor.shape)
             if hasattr(gaussians, "_sem_logits") and gaussians._sem_logits is not None:
                 print("sem_logits shape:", gaussians._sem_logits.shape)
             else:
                 print("_sem_logits is None")
-
-            anchor_xyz = gaussians.get_anchor.detach().cpu().numpy()
-            logits = gaussians._sem_logits.detach().cpu().numpy()
-            smoothed_logits = weighted_logit_mean(anchor_xyz, logits)
-            # Pi = gaussians.get_sem_probs()              # [N_anchor, K], softmaxed
-            Pi = row_softmax(smoothed_logits)
-            cls_idx = np.full(Pi.shape[0], -1, int)
-            mask_conf = Pi.max(axis=1) >= 0.5   # shape (N,)
             
-            cls_idx[mask_conf] = Pi[mask_conf].argmax(axis=1)
+            # 1
+            # anchor_xyz = gaussians.get_anchor.detach().cpu().numpy()
+            # logits = gaussians._sem_logits.detach().cpu().numpy()
+            # smoothed_logits = weighted_logit_mean(anchor_xyz, logits)
+            # # Pi = gaussians.get_sem_probs()              # [N_anchor, K], softmaxed
+            # Pi = row_softmax(smoothed_logits)
+            # cls_idx = np.full(Pi.shape[0], -1, int)
+            # mask_conf = Pi.max(axis=1) >= 0.5   # shape (N,)
+            # cls_idx[mask_conf] = Pi[mask_conf].argmax(axis=1)
+
+            # 2
+            # logits = gaussians._sem_logits.detach().cpu().numpy()  # raw
+            # Pi     = softmax(logits, axis=1)
+            # cls_idx = np.full(Pi.shape[0], -1, int)
+            # mask_conf = Pi.max(axis=1) >= 0.5
+            # cls_idx[mask_conf] = Pi[mask_conf].argmax(axis=1)
+
+            # 3
+            logits = gaussians._sem_logits.detach().cpu().numpy()   # [N,K]
+            Pi = softmax(logits, axis=1)                            # [N,K]
+            cls_idx = Pi.argmax(axis=1).astype(int)                 # [N]
         
         anchor_xyz = gaussians.get_anchor.detach().cpu().numpy()
         classes = get_classes()                         # same list used when you constructed GaussianModel
-        palette = contrast_palette2(classes)         # [K,3] floats in [0,1]
-        anchor_colors = palette[cls_idx] 
+        # palette = contrast_palette2(classes)         # [K,3] floats in [0,1]
+        # anchor_colors = palette[cls_idx] 
+        # anchor_colors = palette[np.clip(cls_idx, 0, palette.shape[0]-1)]
+
+        anchor_colors = np.zeros((anchor_xyz.shape[0], 3), dtype=np.float32)
+
+        # cls==60 -> white
+        anchor_colors[cls_idx == 90] = (1.0, 1.0, 1.0)
+
+        # noise = (cls_idx == -1)
+        # anchor_colors[noise] = np.array([0.6, 0.6, 0.6], dtype=np.float64)
         
+        
+        # noise = (cls_idx == -1)
+        # if noise.any():
+        #     anchor_colors[noise] = np.array([0, 0, 0], dtype=np.float64)
 
         points = points.cpu().detach().numpy()
         points_normals = torch.nn.functional.normalize(normal).cpu().detach().numpy()
@@ -281,11 +354,22 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         pcd.normals = o3d.utility.Vector3dVector(scaled_normals)
         # o3d.visualization.draw_geometries([pcd], point_show_normal=True)
         # mesh.compute_vertex_normals()
-        
+
         from scipy.spatial import cKDTree
+
+        # k = gaussians.n_offsets 
+        # N_anchor = gaussians.get_anchor.shape[0]
+        # anchor_cls_rep = anchor_cls.repeat_interleave(k)
+
+        # kdtree = cKDTree(points)
+        # verts = np.asarray(mesh.vertices)
+        # _, idx = kdtree.query(verts, k=1)
+        # v_colors = gauss_colors[idx]
+        
         kdtree = cKDTree(anchor_xyz)
         verts = np.asarray(mesh.vertices)
-        _, idx = kdtree.query(verts, k=1) 
+        _, idx = kdtree.query(verts, k=1)
+
         v_colors = anchor_colors[idx] 
 
 
@@ -294,7 +378,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         mesh.vertex_colors = o3d.utility.Vector3dVector(v_colors.astype(np.float64))
         # print("verts:", len(mesh.vertices), "colors:", len(mesh.vertex_colors))
         # Write the mesh to a file, including vertex colors
-        o3d.io.write_triangle_mesh(os.path.join(model_path, "semantic_mesh_poisson_smoothed_{}".format(iteration)+ ".ply"), mesh, write_vertex_colors=True)
+        o3d.io.write_triangle_mesh(os.path.join(model_path, "semantic_mesh_poisson_explicit_d8l0.1_{}".format(iteration)+ ".ply"), mesh, write_vertex_colors=True)
 
 
         # o3d.io.write_triangle_mesh(os.path.join(model_path, "extracted_mesh_poisson_{}".format(iteration)+ ".ply"), mesh)        

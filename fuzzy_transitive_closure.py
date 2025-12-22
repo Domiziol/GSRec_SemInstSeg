@@ -249,7 +249,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_path")
     args = get_combined_args(parser)
 
-    files_path = "./data/replica/scan1/masks_real2/"
+    files_path = "./data/replica/scan1/2Dclassification_tests/test1/results/"
 
 
     # Initialize system state (RNG) -- what is that ????
@@ -345,7 +345,7 @@ if __name__ == "__main__":
     embds = nn.functional.normalize(embeddings.weight, dim=1).detach().cpu().numpy()
 
     print("total loss", total_loss)
-    np.save(f"embeddings_norm_{voxel_size}_{steps}_withtrace.npy", embds)
+    np.save(f"embeddings_norm_{voxel_size}_{steps}_withtrace_16k.npy", embds)
     # === End of training ===
 
 

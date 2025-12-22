@@ -339,6 +339,74 @@ def row_softmax(Z):
     Z /= Z.sum(axis=1, keepdims=True)
     return Z
 
+def estimate_scales(anchor_points, embeddings, logits,
+                    k_candidates=512,
+                    sample_size=10000,
+                    random_state=0):
+    N = anchor_points.shape[0]
+    rng = np.random.default_rng(random_state)
+    idx_sample = rng.choice(N, size=min(sample_size, N), replace=False)
+
+    # kNN po geometrii
+    nn = NearestNeighbors(
+        n_neighbors=min(k_candidates + 1, N),
+        metric="euclidean",
+        algorithm="ball_tree",
+        n_jobs=-1,
+    ).fit(anchor_points.astype(np.float32, copy=False))
+
+    dists, inds = nn.kneighbors(anchor_points[idx_sample], return_distance=True)
+    dists_no_self = dists[:, 1:]          # (Ns, K)
+
+    # skala XYZ
+    s_xyz = np.percentile(dists_no_self, 90)
+
+    # przygotowanie logitów
+    logits_f = logits.astype(np.float32, copy=False)
+    norms = np.linalg.norm(logits_f, axis=1)
+    norms[norms == 0.0] = 1.0
+
+    emb_vals = []
+    sem_vals = []
+
+    for row_idx, i in enumerate(idx_sample):
+        neigh = inds[row_idx, 1:]
+        if neigh.size == 0:
+            continue
+
+        # EMB
+        diff_emb = embeddings[i] - embeddings[neigh]
+        d_emb = np.linalg.norm(diff_emb, axis=1)
+        emb_vals.append(d_emb)
+
+        # SEM (cosine distance)
+        v_i = logits_f[i]
+        norm_i = norms[i]
+        v_j = logits_f[neigh]
+        norm_j = norms[neigh]
+
+        dot = np.sum(v_j * v_i, axis=1)
+        cos_sim = dot / (norm_i * norm_j)
+        cos_sim = np.clip(cos_sim, -1.0, 1.0)
+        d_sem = 1.0 - cos_sim
+
+        sem_vals.append(d_sem)
+
+    emb_vals = np.concatenate(emb_vals)
+    sem_vals = np.concatenate(sem_vals)
+
+    s_emb = np.percentile(emb_vals, 85)
+    s_sem = np.percentile(sem_vals, 70)
+
+    print("scales:", "xyz", s_xyz, "emb", s_emb, "sem", s_sem)
+    # xyz-90, emb-90, sem-90
+    # scales: xyz 0.12005415831565483 emb 1.6521441 sem 0.026729107 [07/12 22:17:14]
+
+    # xyz-90, emb-85, sem-70
+    # scales: xyz 0.12005415831565483 emb 1.2897918 sem 0.009147525 [07/12 22:48:04]
+    return s_xyz, s_emb, s_sem
+
+
 if __name__ == "__main__":
     # Set up command line argument parser with default parameters
     parser = ArgumentParser(description="Testing script parameters")
@@ -398,158 +466,89 @@ if __name__ == "__main__":
     anchors_downsampled_id = np.arange(anchors_downsampled.shape[0])
     # projection_data_down = generate_sam_data_for_anchors(anchors_downsampled, all_views, files_path, anchors_downsampled_id)
 
-    
-    # proj = torch.from_numpy(projection_data_down).long()
-    N, V = projection_data.shape
-      
+    N, V = anchor_points.shape
 
-    # probs = sp.softmax(logits, axis = 1).astype(np.float32)
-    # prob_squares = np.sqrt(probs)
+    def softmax_max_and_argmax(logits: np.ndarray):
+        """Stable softmax max-prob and argmax for each row."""
+        x = logits.astype(np.float32, copy=False)
+        x = x - np.max(x, axis=1, keepdims=True)
+        ex = np.exp(x)
+        s = ex / np.sum(ex, axis=1, keepdims=True)
+        conf = np.max(s, axis=1)
+        cls  = np.argmax(s, axis=1).astype(np.int32)
+        return conf, cls
 
-    
-    def agreement(a,b):
-        both_pos = (a > 0) & (b > 0)                 # mask where both are positive
-        denom = int(np.count_nonzero(both_pos))
-        if denom == 0:
-            return 1.0                                # convention
+    def semantic_distance_onehot_neighbors(
+        logits: np.ndarray,
+        inds_no_self: np.ndarray,
+        conf_thr: float = 0.5,
+        same_dist: float = 0.1,
+        diff_dist: float = 1.0,
+        unknown_unknown_dist: float = 1.0,
+        unknown_other_dist: float = 0.6,
+    ):
+        """
+        Returns d_sem of shape (N, K) for each anchor i to its neighbors inds_no_self[i, :].
+        Rules:
+        - if both unknown (conf < thr): distance = unknown_unknown_dist
+        - else if both confident and same class: distance = same_dist
+        - else (different class OR one unknown): distance = diff_dist / unknown_other_dist
+        """
+        N, K = inds_no_self.shape
+        conf, cls = softmax_max_and_argmax(logits)
+        known = conf >= conf_thr
 
-        num = int(np.count_nonzero((a == b) & both_pos))
-        return 1-num / denom
-    
-    
-    def agreement_many(mask_ids_i, mask_ids_B):
-        vis_i  = mask_ids_i != -1
-        vis_B  = mask_ids_B != -1
-        co_vis = vis_B & vis_i
-        denom  = np.count_nonzero(co_vis, axis=1)
-        same   = (mask_ids_B == mask_ids_i) & co_vis
-        num    = np.count_nonzero(same, axis=1)
-        out = np.ones(mask_ids_B.shape[0], dtype=np.float32)
-        m = denom > 0
-        out[m] = 1.0 - (num[m] / denom[m])
-        return out
-    
-    def agreement_single(mask_ids_i: np.ndarray, mask_ids_j: np.ndarray) -> float:   
-        vis = (mask_ids_i != -1) & (mask_ids_j != -1)
-        denom = int(np.count_nonzero(vis))
-        if denom == 0:
-            return 1.0
-        num = int(np.count_nonzero((mask_ids_i == mask_ids_j) & vis))
-        return 1.0 - (num / denom)
-    
-    
-    def euclidean_many(point, neighbours: np.ndarray) -> np.ndarray:
-        diff = neighbours - point
-        d2 = np.einsum('ij,ij->i', diff, diff, optimize=True)
-        return np.sqrt(d2, dtype=np.float32)
+        d_sem = np.empty((N, K), dtype=np.float32)
 
-
-    # w_euc = 3 
-    # w_emb = 100
-    # those two combined with sample_weight=count give actually better results than without it
-
-    # if only emb the 100 was fine
-
-    def build_precomputed_combined(embds, anchors, eps):
-        N, V = embds.shape
-        
-        rows, cols, data = [], [], []
-        
         for i in range(N):
-            for j in range(i + 1, N):
-                d_euc = np.linalg.norm(anchors[i] - anchors[j])  # euclidean
-                d_emb = cosine(embds[i], embds[j])  # cosine distance (1-cosine similarity)
-                
-                    
-                # d = w_euc * d_euc + w_emb * d_emb + w_sem * d_sem
-                d = d_euc * w_euc + w_emb * d_emb
-                if d <= eps:    
-                    rows.append(i); cols.append(j); data.append(d)
+            neigh = inds_no_self[i]
+            ki = known[i]
 
-        A = csr_matrix((np.asarray(data, np.float32), (np.asarray(rows), np.asarray(cols))), shape=(N, N))
-        A.setdiag(0.0)
-        A = A.maximum(A.T)  # symmetrize
-        return A
+            if not ki:
+                # i unknown
+                kj = known[neigh]
+                # both unknown -> 1, mixed -> unknown_other_dist
+                d_sem[i] = np.where(kj, unknown_other_dist, unknown_unknown_dist).astype(np.float32)
+            else:
+                # i known
+                kj = known[neigh]
+                same = (cls[neigh] == cls[i]) & kj
+                # if neighbor unknown -> unknown_other_dist
+                # if neighbor known & same -> same_dist
+                # else -> diff_dist
+                d_sem[i] = np.where(~kj, unknown_other_dist,
+                                    np.where(same, same_dist, diff_dist)).astype(np.float32)
 
-    def build_precomputed_emb(masks_ids, embds, eps):
-        N, V = embds.shape
-        
-        rows, cols, data = [], [], []
-        
-        
-        for i in range(N):
-            for j in range(i + 1, N):
-                # d = np.linalg.norm(embds[i] - embds[j])  # euclidean
-                
-                d = cosine(embds[i], embds[j])
-                if d <= eps:    
-                    rows.append(i); cols.append(j); data.append(d)
+        return d_sem
 
-        A = csr_matrix((np.asarray(data, np.float32), (np.asarray(rows), np.asarray(cols))), shape=(N, N))
-        A = A.maximum(A.T)  # symmetrize
-        return A
-    
-    def build_precomputed_euc(points, eps):
-        N = points.shape[0]
-        
-    
-        rows, cols, data = [], [], []
-        i_idx, j_idx = np.triu_indices(N, k=1)
-    
-        dists = np.linalg.norm(points[i_idx] - points[j_idx], axis=1)
-
-        mask = dists <= eps
-
-        rows.extend(i_idx[mask].tolist())
-        cols.extend(j_idx[mask].tolist())
-        data.extend(dists[mask].tolist())
-
-        A = csr_matrix((np.asarray(data, np.float32), (np.asarray(rows), np.asarray(cols))), shape=(N, N))
-        A.setdiag(0.0)
-        A = A.maximum(A.T)  # symmetrize
-        return A
-    
-    def build_precomputed_combined_simple(embds, points, eps):
-        N = points.shape[0]
-    
-        rows, cols, data = [], [], []
-        i_idx, j_idx = np.triu_indices(N, k=1)
-    
-        dists_euc = np.linalg.norm(points[i_idx] - points[j_idx], axis=1)
-
-        D = cosine_distances(embds)      # (N, N) matrix of cosine distances = 1 - cosine similarity
-        dists_emb = D[i_idx, j_idx] 
-
-        dists = dists_euc * w_euc + dists_emb * w_emb
-
-        mask = dists <= eps
-
-        rows.extend(i_idx[mask].tolist())
-        cols.extend(j_idx[mask].tolist())
-        data.extend(dists[mask].tolist())
-
-        A = csr_matrix((np.asarray(data, np.float32), (np.asarray(rows), np.asarray(cols))), shape=(N, N))
-        A.setdiag(0.0)
-        A = A.maximum(A.T)  # symmetrize
-        return A
-    
     # setup of weights equal regarding 90th percentile of each distance:
     # w_dist = 0.2
     # w_emb = 0.0185
     # w_sem = 1.5
 
     # current setup
-    w_dist = 0.2
-    w_emb = 0.0185
-    w_sem = 1.5
-    def build_precomputed(anchor_points, projection_data, embeddings, logits, k_candidates = 512):
+    w_dist = 0.0    # if 1, eps = 0.2 is quite nice, 90th
+    w_emb = 0.0     # if 1, eps = 0.12, 0.15 is quite nice, 90th
+    w_sem =1.0     # if 1, eps = 0.05 is quite nice, 90th
+    def build_precomputed(anchor_points, projection_data, embeddings, eps, logits, k_candidates = 512):
         
         mask_ids = projection_data
         N, V = mask_ids.shape
 
         rows, cols, data = [], [], []
 
-        sum_eps = 0
+        # for experiments 
+        #s_xyz, s_emb, s_sem = estimate_scales(anchor_points, embds_full, smoothed_logits, 512, 10000)
+
+        # this is 90th percentile
+        # s_xyz=0.12005415831565483 
+        # s_emb=1.6521441
+        # s_sem=0.026729107
+
+
+        s_xyz=0.12005415831565483 # 90th
+        s_emb=1.2897918     # 85th
+        s_sem=0.009147525   # 70th
 
         nn = NearestNeighbors(
             n_neighbors=min(k_candidates + 1, N),
@@ -563,8 +562,8 @@ if __name__ == "__main__":
         inds_no_self  = inds[:, 1:]    # (N, K-1)
 
         vals = dists[:, 1:].ravel()              # skip self-distances in column 0
-        p90 = np.percentile(vals, 90)
-        print("90th percentile distance:", p90)
+        # p90 = np.percentile(vals, 90)
+        # print("90th percentile distance:", p90)
         # 90th percentile distance: 0.16545089823789488 [23/11 18:44:52]
 
         logits = smoothed_logits.astype(np.float32, copy=False)  # (N, C)
@@ -572,6 +571,15 @@ if __name__ == "__main__":
         norms[norms == 0.0] = 1.0
 
         emb_vals, sem_vals, comb_vals = [], [], []
+        d_sem_mat = semantic_distance_onehot_neighbors(
+            logits=smoothed_logits,   # or logits argument
+            inds_no_self=inds_no_self,
+            conf_thr=0.5,
+            same_dist=0.1,
+            diff_dist=1.0,
+            unknown_unknown_dist=1.0,
+            unknown_other_dist=0.6,   
+        )
 
         for i in range(N):
             neigh = inds_no_self[i]
@@ -582,32 +590,33 @@ if __name__ == "__main__":
             
             diff_emb = embeddings[i] - embeddings[neigh]      # (len(neigh), d_emb)
             d_emb = np.linalg.norm(diff_emb, axis=1)
+
+            d_sem = d_sem_mat[i]
                 
-            v_i = logits[i]
-            norm_i = norms[i]
+            # v_i = logits[i]
+            # norm_i = norms[i]
 
-            v_j = logits[neigh]
-            norm_j = norms[neigh]
+            # v_j = logits[neigh]
+            # norm_j = norms[neigh]
 
-            # dot products
-            dot = np.sum(v_j * v_i, axis=1)                   
+            # # dot products
+            # dot = np.sum(v_j * v_i, axis=1)                   
 
-            # cosine similarity and distance
-            cos_sim = dot / (norm_i * norm_j)
-            cos_sim = np.clip(cos_sim, -1.0, 1.0)
-            d_sem = 1.0 - cos_sim
+            # # cosine similarity and distance
+            # cos_sim = dot / (norm_i * norm_j)
+            # cos_sim = np.clip(cos_sim, -1.0, 1.0)
+            # d_sem = 1.0 - cos_sim
 
-            d = d_emb * w_emb + d_xyz * w_dist + w_sem * d_sem
+            D_xyz = np.clip(d_xyz / s_xyz, 0.0, 1.0)
+            D_emb = np.clip(d_emb / s_emb, 0.0, 1.0)
+            D_sem = np.clip(d_sem / s_sem, 0.0, 1.0)
 
-            emb_vals.append(d_emb)
-            sem_vals.append(d_sem)
-            comb_vals.append(d)
 
-            
-            eps = np.percentile(d, 98)
-            
+            d = D_emb * w_emb + D_xyz * w_dist + w_sem * D_sem
 
-            sum_eps += eps
+            # emb_vals.append(D_emb)
+            # sem_vals.append(d_sem)
+            # comb_vals.append(d)
 
             # rows.extend([i] * len(neigh))
             # cols.extend(neigh.tolist())
@@ -627,21 +636,21 @@ if __name__ == "__main__":
         A = csr_matrix((np.asarray(data, np.float32), (np.asarray(rows), np.asarray(cols))), shape=(N, N))
         A = A.maximum(A.T)  # symmetrize
 
-        for name, vals in [("d_emb", emb_vals), ("d_sem", sem_vals), ("d", comb_vals)]:
-            v = np.concatenate(vals)
-            print(name, "90th percentile:", np.percentile(v, 90))
+        # for name, vals in [("d_emb", emb_vals), ("d_sem", sem_vals), ("d", comb_vals)]:
+        #     v = np.concatenate(vals)
+        #     print(name, "90th percentile:", np.percentile(v, 90))
 
         # d_emb 90th percentile: 1.7861496 [23/11 18:45:06]
         # d_sem 90th percentile: 0.033379257 [23/11 18:45:07]
         # d 90th percentile: 0.20250601678229865 [23/11 18:45:08]
 
-        return A, sum_eps/N
+        return A
     
     
     # o3d.visualization.draw_geometries([newpcd])
     
-    min_samples = 20
-    embds = np.load(f"embeddings_norm_{voxel_size}_{200}_withtrace.npy")
+    min_samples = 2
+    embds = np.load(f"trained_embeddings/embeddings_norm_{voxel_size}_{200}_withtrace.npy")
 
     M, D = embds.shape
 
@@ -652,34 +661,23 @@ if __name__ == "__main__":
             continue
         embds_full[orig_idxs] = embds[new_idx]
 
-
     
-    # eps = 0.012
-    # print(eps)
+    
+    eps = 0.8
+   
 
-
-    # how to adjust inst_semantic.json from replica?
-    # transformation of original replica mesh to reconstructed mesh goes as follows:
-    # original scaled by 0.25, shifted by (x = -2.95531 m, y = -1.13268 m, z = 0.058562 m) - original origin was in this position but opposite sign
-    # transformation from ICP, applied to original mesh to align with reconstructed was:
-    # [[ 0.94122018  0.00279473 -0.00355684 -0.012922  ]
-    #  [-0.00281858  0.9412056  -0.00632134 -0.00893518]
-    #  [ 0.00353797  0.00633192  0.9412031   0.02424739]
-    #  [ 0.          0.          0.          1.        ]]
-
-
-    A, eps = build_precomputed(
+    A = build_precomputed(
         anchor_points,
         projection_data,
         embds_full,
-        #eps,
+        eps,
         smoothed_logits,
         512
     )
     print(eps)
     labels = DBSCAN(eps=eps, min_samples=min_samples, metric='precomputed').fit_predict(A)
     # labels = DBSCAN(eps=eps, min_samples=min_samples, metric='precomputed').fit_predict(A, sample_weight=counts)  # for later add sample_weight = counts in the sampled voxel as a weight of a poin
-    np.save("inst_v2/dist+emb+sem_combined/experiments/labels.npy", labels)
+    np.save("inst_v2/dist+emb+sem_combined/sem_one_hot/labels.npy", labels)
     
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     n_noise = int((labels == -1).sum())
@@ -726,79 +724,5 @@ if __name__ == "__main__":
     v_colors = anchors_colors[idx] 
     mesh.vertex_colors = o3d.utility.Vector3dVector(v_colors.astype(np.float64))
 
-    o3d.io.write_triangle_mesh(f"inst_v2/dist+emb+sem_combined/experiments/test1.ply", mesh, write_vertex_colors=True)
+    o3d.io.write_triangle_mesh(f"inst_v2/dist+emb+sem_combined/sem_one_hot/test1.ply", mesh, write_vertex_colors=True)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    # n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-    # n_noise = int((labels == -1).sum())
-    # print(f"{n_clusters=}, {n_noise=}")
-
-    # palette = contrast_palette(np.unique(labels))
-
-
-    # anchors_colors = palette[labels]
-
-    # # make noise a neutral gray (optional)
-    # noise = (labels == -1)
-    # if noise.any():
-    #     anchors_colors[noise] = np.array([0, 0, 0], dtype=np.float64)
-
-    # # assign to your downsampled cloud (embeddings were for anchors_downsampled)
-    # newpcd.colors = o3d.utility.Vector3dVector(anchors_colors)
-
-    
-    # o3d.visualization.draw_geometries([newpcd])
-
-    # points, color, opacity,scaling,rot, normal, _, _, _,_ = generate_neural_gaussians_SDF(all_views[0], gaussianModel, visible_mask=None)
-    # points = points.cpu().detach().numpy()
-    # points_normals = torch.nn.functional.normalize(normal).cpu().detach().numpy()
-    # vertices, triangle, pcd2 = poisson_surface_reconstruction(points, points_normals, 8) # 9
-    # import open3d as o3d
-    # mesh = o3d.geometry.TriangleMesh()
-    # mesh.vertices = o3d.utility.Vector3dVector(vertices)
-    # mesh.triangles = o3d.utility.Vector3iVector(triangle)
-    # mesh.vertex_normals = o3d.utility.Vector3dVector(points_normals)
-    # scale_matrix = np.diag([50, 50, 50])
-    # pcd2.points = o3d.utility.Vector3dVector(np.matmul(scale_matrix, np.asarray(pcd2.points).T).T)
-    # normals = np.asarray(pcd2.normals)
-    # scaled_normals =normals * 0.1
-    # pcd2.normals = o3d.utility.Vector3dVector(scaled_normals)
-    # # o3d.visualization.draw_geometries([pcd], point_show_normal=True)
-    # # mesh.compute_vertex_normals()
-    
-    # from scipy.spatial import cKDTree
-    # kdtree = cKDTree(anchors_downsampled)
-    # verts = np.asarray(mesh.vertices)
-    # _, idx = kdtree.query(verts, k=1) 
-
-    
-    # v_colors = anchors_colors[idx]
-    # vc = v_colors.mean(axis=1)
-    # print(np.shape(mesh.vertices), np.shape(v_colors))
-    # mesh.vertex_colors = o3d.utility.Vector3dVector(v_colors.astype(np.float64))
-    
-    # o3d.io.write_triangle_mesh(f"inst_v2/test1.ply", mesh, write_vertex_colors=True)
-
-
-
-    # NOTES
-    # for euclidean only, best where for eps=0.02, kn=2048 and without / r_s

@@ -125,10 +125,12 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     class_to_idx = {n:i for i,n in enumerate(classes)}
     if not hasattr(opt, "lambda_sem"):
         opt.lambda_sem = 0.0
+    K = len(classes)
+    all_class_idx = list(range(K))
 
     SEM_DELAY  = 8000    # keep semantics off while geometry forms
     # SEM_DELAY  = 0 
-    SEM_WARMUP = 6000    # linearly ramp over 3k iters
+    # SEM_WARMUP = 6000    # linearly ramp over 
     SEM_TARGET = 0.1
 
     first_iter = 0
@@ -154,9 +156,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         if iteration <= SEM_DELAY:
             lambda_sem_now = 0.0
-        elif iteration <= SEM_DELAY + SEM_WARMUP:
-            alpha = (iteration - SEM_DELAY) / float(SEM_WARMUP)
-            lambda_sem_now = SEM_TARGET * alpha
+        # elif iteration <= SEM_DELAY + SEM_WARMUP:
+        #     alpha = (iteration - SEM_DELAY) / float(SEM_WARMUP)
+        #     lambda_sem_now = SEM_TARGET * alpha
         else:
             lambda_sem_now = SEM_TARGET
 
@@ -190,8 +192,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
         # Load masks for image (SAM+CLIP)
-        # samclip_path = "./data/replica/scan1/masks_real2/"
-        samclip_path = "./data/kitchen_static/masks_test3/"
+        samclip_path = "./data/replica/scan1/2Dclassification_tests/test1/results/"
+        # samclip_path = "./data/kitchen_static/masks_test3/"
         image_name = viewpoint_cam.image_name
         base = os.path.splitext(image_name)[0]
         npz_path = os.path.join(samclip_path, f"{base}.npz")
@@ -209,9 +211,14 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             npz = np.load(npz_path)
             masks_np = npz["masks"]
             labels_np = npz["labels"]
-            scores_np = npz["scores"]
+            # scores_np = npz["scores"]
             if labels_np.size > 0:
-                classes_subset = np.unique(labels_np).tolist()  
+                classes_subset = np.unique(labels_np).tolist()
+                
+            #     #per-view:
+            #     classes_subset = all_class_idx
+            # else:
+            #     classes_subset = None  
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad, class_subset = classes_subset)
         
@@ -237,7 +244,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     M = masks_np.shape[0]
                     masks_bool_t = torch.from_numpy(masks_np).to(torch.bool).to(image.device)  # [M,H,W]
                     labels_t   = torch.from_numpy(labels_np).to(torch.long).to(image.device)
-                    scores_t = torch.from_numpy(scores_np).to(torch.float32).to(image.device)
+                    # scores_t = torch.from_numpy(scores_np).to(torch.float32).to(image.device)
 
                     IGNORE = 255
                     target_image = torch.full((H,W), IGNORE, dtype = torch.long, device = image.device)
