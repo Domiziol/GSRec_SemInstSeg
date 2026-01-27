@@ -588,7 +588,7 @@ def preprocess_images_main_test():
 
 def preprocess_images_sam_text_prompt_test():
     input_path = "./data/replica/scan1/images/"
-    output_path = "./data/replica/scan1/2Dclassification_tests/test1"
+    output_path = "./data/replica/scan1/2Dclassification_tests/black"
     # sam_masks_output_path = "./data/replica/scan1/masksonly1/"
     Path(output_path).mkdir(parents=True, exist_ok=True)
     vis_dir = Path(output_path) / "vis"
@@ -603,8 +603,9 @@ def preprocess_images_sam_text_prompt_test():
     clip_model, clip_preprocess, class_prompts, text_feat = prepare_clip(classes)
 
     files = sorted(os.listdir(input_path))
-    idx = list(range(0,5)) + list(range(150,155)) + list(range(200,205)) + list(range(300,305))+ list(range(380,385))
-    for file in (files[i] for i in idx):
+    # idx = list(range(0,5)) + list(range(150,155)) + list(range(200,205)) + list(range(300,305))+ list(range(380,385))
+    # for file in (files[i] for i in idx):
+    for file in files:
         if not file.lower().endswith((".png", ".jpg")):
             continue
             
@@ -666,8 +667,8 @@ def preprocess_images_sam_text_prompt_test():
             x0, x1 = cols.min(), cols.max() + 1
 
             # large margin (pick one style)
-            margin_y = max(40, int(0.35 * (y1 - y0)))
-            margin_x = max(40, int(0.35 * (x1 - x0)))
+            margin_y = max(20, int(0.35 * (y1 - y0)))
+            margin_x = max(20, int(0.35 * (x1 - x0)))
 
             y0 = max(0, y0 - margin_y)
             y1 = min(H0, y1 + margin_y)
@@ -716,10 +717,136 @@ def preprocess_images_sam_text_prompt_test():
         # save_mask_crops(img_pil, masks_bool, labels_idx, scores_arr, classes, crops_root / stem, limit=None)
         
 
+def preprocess_images_sam_text_prompt_test2():
+    input_path = "./data/replica/scan1/images/"
+    output_path = "./data/replica/scan1/2Dclassification_tests/black"
+
+    Path(output_path).mkdir(parents=True, exist_ok=True)
+    vis_dir = Path(output_path) / "vis"
+    vis_dir.mkdir(parents=True, exist_ok=True)
+    crops_root = Path(output_path) / "crops"
+    crops_root.mkdir(parents=True, exist_ok=True)
+
+    # NEW: folder for full-size binary mask images
+    masks_img_root = Path(output_path) / "mask_images"
+    masks_img_root.mkdir(parents=True, exist_ok=True)
+
+    predictor = init_automatic_sam()
+    classes = get_classes()
+    class_to_idx = {n: i for i, n in enumerate(classes)}
+    idx_to_class = {i: n for i, n in enumerate(classes)}
+    clip_model, clip_preprocess, class_prompts, text_feat = prepare_clip(classes)
+
+    files = sorted(os.listdir(input_path))
+    for file in files:
+        if not file.lower().endswith((".png", ".jpg")):
+            continue
+
+        img_path = os.path.join(input_path, file)
+        stem = Path(file).stem
+        img_pil = Image.open(img_path).convert("RGB")
+        img_np = np.array(img_pil)
+
+        masks = get_filtered_masks(predictor, img_np)
+        H0, W0 = img_np.shape[:2]
+
+        if len(masks) == 0:
+            out = Path(output_path) / f"{stem}.npz"
+            np.savez_compressed(
+                out,
+                masks=np.zeros((0, H0, W0), dtype=np.uint8),
+                labels=np.zeros((0,), dtype=np.int16),
+                scores=np.zeros((0,), dtype=np.float32),
+                image_size=np.array([H0, W0], dtype=np.int32),
+                version=np.int32(1),
+            )
+            img_pil.save(vis_dir / f"{stem}_overlay.png")
+            print(f"{file}: no masks after filtering → saved empty npz + overlay")
+            continue
+
+        masks_bool = []
+        for m in masks:
+            seg = np.asarray(m["segmentation"], dtype=bool)
+            if seg.sum() > 0:
+                masks_bool.append(seg)
+        if len(masks_bool) == 0:
+            masks_bool = np.zeros((0, H0, W0), dtype=bool)
+        else:
+            masks_bool = np.stack(masks_bool, axis=0)
+
+        # NEW: save full-size binary mask images (black background, white mask)
+        # one folder per source image
+        mask_img_dir = masks_img_root / stem
+        mask_img_dir.mkdir(parents=True, exist_ok=True)
+
+        for j in range(masks_bool.shape[0]):
+            m = masks_bool[j]
+            mask_u8 = (m.astype(np.uint8) * 255)  # 0/255
+            Image.fromarray(mask_u8, mode="L").save(mask_img_dir / f"mask_{j:03d}.png")
+
+        labels_idx = []
+        scores = []
+        blurred_pil = img_pil.filter(ImageFilter.GaussianBlur(radius=12))
+
+        for j in range(masks_bool.shape[0]):
+            m = masks_bool[j]
+            rows, cols = np.nonzero(m)
+            if rows.size == 0 or cols.size == 0:
+                continue
+
+            y0, y1 = rows.min(), rows.max() + 1
+            x0, x1 = cols.min(), cols.max() + 1
+
+            margin_y = max(20, int(0.35 * (y1 - y0)))
+            margin_x = max(20, int(0.35 * (x1 - x0)))
+
+            y0 = max(0, y0 - margin_y)
+            y1 = min(H0, y1 + margin_y)
+            x0 = max(0, x0 - margin_x)
+            x1 = min(W0, x1 + margin_x)
+
+            crop_pil = img_pil.crop((x0, y0, x1, y1))
+
+            crop_dir = crops_root / stem
+            crop_dir.mkdir(parents=True, exist_ok=True)
+
+            top_classes, top_scores = topk_clip_for_crop(
+                crop_pil, clip_model, clip_preprocess, text_feat, classes, k=1
+            )
+            if len(top_classes) == 0:
+                labels_idx.append(0)
+                scores.append(0.0)
+                pred_name = "unknown"
+            else:
+                labels_idx.append(class_to_idx[top_classes[0]])
+                scores.append(float(top_scores[0]))
+                pred_name = top_classes[0]
+
+            crop_pil.save(crops_root / stem / f"mask_{j:03d}_crop_{pred_name}.png")
+
+        labels_idx = np.asarray(labels_idx, dtype=np.int16)
+        scores_arr = np.asarray(scores, dtype=np.float32)
+        masks_u8 = masks_bool.astype(np.uint8)
+
+        out = Path(output_path) / f"{stem}.npz"
+        np.savez_compressed(
+            out,
+            masks=masks_u8,
+            labels=labels_idx,
+            scores=scores_arr,
+            image_size=np.array([H0, W0], dtype=np.int32),
+            version=np.int32(1),
+        )
+
+        vis = overlay_masks(img_np, masks_bool, labels_idx, scores_arr, classes)
+        vis.save(vis_dir / f"{stem}_overlay.png")
+
+        print(f"{file}: saved {masks_bool.shape[0]} full-size binary masks -> {mask_img_dir}")
+
 if __name__ == '__main__':
     # preprocess_images_main()
     # preprocess_images_main_test()
-    preprocess_images_sam_text_prompt_test()
+    preprocess_images_sam_text_prompt_test2()
 
 
 

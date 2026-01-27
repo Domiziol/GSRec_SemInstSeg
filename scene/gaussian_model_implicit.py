@@ -492,9 +492,6 @@ class GaussianModel:
     
     # semantic
     def get_sem_probs(self):
-        
-        #   Returns per-anchor class probabilities, shape [N, K].
-        #   softmax(_sem_logits) along classes.
         self._ensure_sem_logits()
         return torch.softmax(self._sem_logits, dim=1)
 

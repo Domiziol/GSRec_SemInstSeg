@@ -152,6 +152,54 @@ def build_covisibility_matrix(visible_ids, covis):
         i, j = (a, b) if a < b else (b, a)
         covis[int(i), int(j)] += 1
 
+def weighted_logit_mean(
+    anchors_xyz,
+    logits,
+    k=50,
+    self_weight=1.0,
+    use_entropy=True,
+    alpha=0.5):
+
+    N, K = logits.shape
+
+    idx_sorted = np.argsort(logits, axis=1)
+    top1 = logits[np.arange(N), idx_sorted[:, -1]]
+    top2 = logits[np.arange(N), idx_sorted[:, -2]]
+    margin = top1 - top2
+    conf_margin = 1.0 / (1.0 + np.exp(-margin / 2.0))
+
+    if use_entropy:
+        z = logits - logits.max(axis=1, keepdims=True)
+        ez = np.exp(z)
+        sum_ez = ez.sum(axis=1, keepdims=True)
+        P = ez / np.clip(sum_ez, 1e-12, None)
+        # H = -sum p*log p
+        H = -(P * np.log(np.clip(P, 1e-12, 1.0))).sum(axis=1)
+        Hmax = np.log(K)
+        conf_entropy = 1.0 - H / (Hmax + 1e-12)
+        
+        conf = alpha * conf_entropy + (1.0 - alpha) * conf_margin
+    else:
+        conf = conf_margin
+
+    nn = NearestNeighbors(n_neighbors=min(k, N)).fit(anchors_xyz)
+    dists, nbr_idx = nn.kneighbors(anchors_xyz, return_distance=True)
+
+    nz = dists[dists > 0]
+    sigma_s = (np.median(nz) if nz.size else 1.0) + 1e-9
+
+    W = np.exp(-(dists**2) / (2.0 * sigma_s**2))
+    W *= conf[nbr_idx]   # neighbor's confidence
+
+    w_self = self_weight * conf
+    denom = np.maximum(w_self + W.sum(axis=1), 1e-12)
+
+    z_neighbors = (W[..., None] * logits[nbr_idx]).sum(axis=1)
+    z_self = (w_self[:, None] * logits)
+
+    z_out = (z_self + z_neighbors) / denom[:, None]
+    return z_out
+
 import colorsys
 def palette_from_labels(labels, s=0.65, v=0.95):
     l = len(labels)
@@ -243,7 +291,7 @@ def contrast_palette2(
 
     # Now handle noise label as mid-gray (or tweak as you like)
     if has_noise:
-        gray = np.array([0.6, 0.6, 0.6], dtype=np.float32)
+        gray = np.array([1, 1, 1], dtype=np.float32)
         table[labels == noise_label] = gray
 
     return table
@@ -357,53 +405,30 @@ def apply_full_transform(points: np.ndarray) -> np.ndarray:
     pts_tf = (transform @ pts_h.T).T[:, :3]  # z powrotem (N, 3)
     return pts_tf
 
-def weighted_logit_mean(
+
+def mean_logit_smoothing(
     anchors_xyz,
     logits,
-    k=50,
-    self_weight=1.0,
-    use_entropy=True,
-    alpha=0.5):
+    k=30,
+    self_weight=2.0,
+):
+    
 
     N, K = logits.shape
 
-    idx_sorted = np.argsort(logits, axis=1)
-    top1 = logits[np.arange(N), idx_sorted[:, -1]]
-    top2 = logits[np.arange(N), idx_sorted[:, -2]]
-    margin = top1 - top2
-    conf_margin = 1.0 / (1.0 + np.exp(-margin / 2.0))
-
-    if use_entropy:
-        z = logits - logits.max(axis=1, keepdims=True)
-        ez = np.exp(z)
-        sum_ez = ez.sum(axis=1, keepdims=True)
-        P = ez / np.clip(sum_ez, 1e-12, None)
-        # H = -sum p*log p
-        H = -(P * np.log(np.clip(P, 1e-12, 1.0))).sum(axis=1)
-        Hmax = np.log(K)
-        conf_entropy = 1.0 - H / (Hmax + 1e-12)
-        
-        conf = alpha * conf_entropy + (1.0 - alpha) * conf_margin
-    else:
-        conf = conf_margin
-
     nn = NearestNeighbors(n_neighbors=min(k, N)).fit(anchors_xyz)
-    dists, nbr_idx = nn.kneighbors(anchors_xyz, return_distance=True)
+    _, nbr_idx = nn.kneighbors(anchors_xyz, return_distance=True)
 
-    nz = dists[dists > 0]
-    sigma_s = (np.median(nz) if nz.size else 1.0) + 1e-9
+    z_neighbors = logits[nbr_idx].sum(axis=1)
 
-    W = np.exp(-(dists**2) / (2.0 * sigma_s**2))
-    W *= conf[nbr_idx]   # neighbor's confidence
+    z_self = self_weight * logits
 
-    w_self = self_weight * conf
-    denom = np.maximum(w_self + W.sum(axis=1), 1e-12)
+    # Normalization
+    denom = self_weight + nbr_idx.shape[1]
 
-    z_neighbors = (W[..., None] * logits[nbr_idx]).sum(axis=1)
-    z_self = (w_self[:, None] * logits)
-
-    z_out = (z_self + z_neighbors) / denom[:, None]
+    z_out = (z_self + z_neighbors) / denom
     return z_out
+
 
 def row_softmax(Z):
     Z = Z.astype(np.float64, copy=True)
@@ -412,14 +437,32 @@ def row_softmax(Z):
     Z /= Z.sum(axis=1, keepdims=True)
     return Z
 
+def js_distance_rows(P_neigh: np.ndarray, p_i: np.ndarray) -> np.ndarray:
+    """
+    Jensen–Shannon distance między wieloma rozkładami P_neigh (K,C)
+    a jednym rozkładem p_i (C,). Zwraca (K,) w [0,1] dla base=2.
+    Działa na różnych wersjach SciPy (axis albo fallback pętlą).
+    """
+    try:
+        # SciPy nowsze: obsługuje axis
+        return jensenshannon(P_neigh, p_i[None, :], axis=1, base=2)
+    except TypeError:
+        # SciPy starsze: fallback
+        out = np.empty((P_neigh.shape[0],), dtype=np.float32)
+        for k in range(P_neigh.shape[0]):
+            out[k] = jensenshannon(P_neigh[k], p_i, base=2)
+        return out
+
+
 def estimate_scales(anchor_points, 
                     embeddings, 
                     logits,
                     k_candidates,
                     sample_size,
-                    p_dist, 
-                    p_emb, 
-                    p_sem):
+                    # p_dist, 
+                    # p_emb, 
+                    # p_sem
+                    ):
     N = anchor_points.shape[0]
     rng = np.random.default_rng(0)
     idx_sample = rng.choice(N, size=min(sample_size, N), replace=False)
@@ -436,12 +479,18 @@ def estimate_scales(anchor_points,
     dists_no_self = dists[:, 1:]
 
     # skala XYZ
-    s_xyz = np.percentile(dists_no_self, p_dist)
+    # s_xyz = np.percentile(dists_no_self, p_dist)
+    s_xyz = float(np.median(dists_no_self))
 
     # przygotowanie logitów
     logits_f = logits.astype(np.float32, copy=False)
     norms = np.linalg.norm(logits_f, axis=1)
     norms[norms == 0.0] = 1.0
+
+    emb_vals = []
+    sem_vals = []
+
+    P = row_softmax(logits)  # (N, C), float64, sum=1
 
     emb_vals = []
     sem_vals = []
@@ -456,24 +505,17 @@ def estimate_scales(anchor_points,
         d_emb = np.linalg.norm(diff_emb, axis=1)
         emb_vals.append(d_emb)
 
-        # SEM (cosine distance)
-        v_i = logits_f[i]
-        norm_i = norms[i]
-        v_j = logits_f[neigh]
-        norm_j = norms[neigh]
-
-        dot = np.sum(v_j * v_i, axis=1)
-        cos_sim = dot / (norm_i * norm_j)
-        cos_sim = np.clip(cos_sim, -1.0, 1.0)
-        d_sem = 1.0 - cos_sim
-
+        # SEM: Jensen–Shannon distance na prawdopodobienstwach
+        d_sem = js_distance_rows(P[neigh], P[i])   # (K,)
         sem_vals.append(d_sem)
 
     emb_vals = np.concatenate(emb_vals)
     sem_vals = np.concatenate(sem_vals)
 
-    s_emb = np.percentile(emb_vals, p_emb)
-    s_sem = np.percentile(sem_vals, p_sem)
+    # s_emb = np.percentile(emb_vals, p_emb)
+    # s_sem = np.percentile(sem_vals, p_sem)
+    s_emb = float(np.median(emb_vals))
+    s_sem = float(np.median(sem_vals))
 
     print("scales:", "xyz", s_xyz, "emb", s_emb, "sem", s_sem)
     # xyz-90, emb-90, sem-90
@@ -496,12 +538,12 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_path")
     args = get_combined_args(parser)
 
-    choose_model = 16        # CHANGE HERE
+    choose_model = 8        # CHANGE HERE
 
     files_path = "./data/replica/scan1/2Dclassification_tests/test1/results/"
     emb_path = f"./outputs/final_sam3/d{choose_model}k_l01/"+"embeddings_norm_0.04_200_withtrace.npy"
     # emb_path = "./trained_embeddings/embeddings_norm_0.04_200_withtrace.npy"
-    instance_id_save_path = f"./experiments2_fromsam3/model_d{choose_model}k/instance_ids.npy"
+    instance_id_save_path = f"./experiments3/model_d{choose_model}k/instance_ids.npy"
     
 
 
@@ -547,21 +589,27 @@ if __name__ == "__main__":
     # w_sem = 1.5
 
     # current setup
+    a_dist = 0.6
+    a_emb = 0.2
+
     w_dist = 0.0    # if 1, eps = 0.2 is quite nice, 90th
-    w_emb = 1.0     # if 1, eps = 0.12, 0.15 is quite nice, 90th
-    w_sem = 0.0     # if 1, eps = 0.05 is quite nice, 90th
+    w_emb = 0.0     # if 1, eps = 0.12, 0.15 is quite nice, 90th
+    w_sem = 1.0    # if 1, eps = 0.05 is quite nice, 90th
+
+    eps = 0.7
 
     # percentiles for scale calculations (lower percentile -> lower eps -> more clusters)
-    p_dist = 85
-    p_emb = 78
-    p_sem = 70
+    # p_dist = 85
+    # p_emb = 78
+    # p_sem = 70
 
     k_neighbours = 512
 
-    output_path = f"./experiments2_fromsam3/model_d{choose_model}k/"+f"wdist={w_dist}_wemb={w_emb}_wsem={w_sem}_pdist{p_dist}_pemb{p_emb}_psem{p_sem}_{k_neighbours}"
-    mesh_save_path = output_path + "/both_segmentations.ply"
-    out_path = Path(output_path)
-    out_path.mkdir(parents=True, exist_ok=True)
+    # output_path = f"./experiments3/model_d{choose_model}k/"+f"wdist={w_dist}_wemb={w_emb}_wsem={w_sem}_pdist{p_dist}_pemb{p_emb}_psem{p_sem}_{k_neighbours}"
+    # output_path = f"./experiments3/model_d{choose_model}k/"+f"wdist={w_dist}_wemb={w_emb}_wsem={w_sem}_{k_neighbours}"
+    # mesh_save_path = output_path + "/both_segmentations.ply"
+    # out_path = Path(output_path)
+    # out_path.mkdir(parents=True, exist_ok=True)
 
     def build_precomputed(anchor_points, embeddings, eps, logits, k_candidates = 512):
         
@@ -570,7 +618,7 @@ if __name__ == "__main__":
         rows, cols, data = [], [], []
 
         # for experiments 
-        s_xyz, s_emb, s_sem = estimate_scales(anchor_points, embds_full, smoothed_logits, 512, 10000, p_dist, p_emb, p_sem)
+        s_xyz, s_emb, s_sem = estimate_scales(anchor_points, embds_full, smoothed_logits, 512, 10000)
 
         # this is 90th percentile
         # s_xyz=0.12005415831565483 
@@ -601,6 +649,8 @@ if __name__ == "__main__":
         norms = np.linalg.norm(logits, axis=1)
         norms[norms == 0.0] = 1.0
 
+        P = row_softmax(smoothed_logits)
+        # pmax = P.max(axis=1)
         # emb_vals, sem_vals, comb_vals = [], [], []
 
         for i in range(N):
@@ -613,23 +663,52 @@ if __name__ == "__main__":
             diff_emb = embeddings[i] - embeddings[neigh]
             d_emb = np.linalg.norm(diff_emb, axis=1)
                 
-            v_i = logits[i]
-            norm_i = norms[i]
+            # v_i = logits[i]
+            # norm_i = norms[i]
 
-            v_j = logits[neigh]
-            norm_j = norms[neigh]
+            # v_j = logits[neigh]
+            # norm_j = norms[neigh]
 
-            # dot products
-            dot = np.sum(v_j * v_i, axis=1)                   
+            # # dot products
+            # dot = np.sum(v_j * v_i, axis=1)                   
 
             # cosine similarity and distance
-            cos_sim = dot / (norm_i * norm_j)
-            cos_sim = np.clip(cos_sim, -1.0, 1.0)
-            d_sem = 1.0 - cos_sim
+            # cos_sim = dot / (norm_i * norm_j)
+            # cos_sim = np.clip(cos_sim, -1.0, 1.0)
+            # d_sem = 1.0 - cos_sim
 
-            D_xyz = np.clip(d_xyz / s_xyz, 0.0, 1.0)
-            D_emb = np.clip(d_emb / s_emb, 0.0, 1.0)
-            D_sem = np.clip(d_sem / s_sem, 0.0, 1.0)
+            d_sem = js_distance_rows(P[neigh], P[i])       # [0,1]
+
+            # d_sem_s = d_sem / s_sem
+
+            # bounded, smooth transform -> [0,1)
+            # D_sem = d_sem_s / (1.0 + d_sem_s)
+
+            # # Hard gate: jesli punkt lub sasiad ma plaski rozklad -> semantyka niewiarygodna
+            # unreliable = (pmax[i] < tau_sem) | (pmax[neigh] < tau_sem)
+            # if np.any(unreliable):
+            #     D_sem = D_sem.copy()
+            #     D_sem[unreliable] = 0.7
+
+            # D_xyz = np.clip(d_xyz / s_xyz, 0.0, 1.0)
+            # D_emb = np.clip(d_emb / s_emb, 0.0, 1.0)
+            # D_sem = np.clip(d_sem / s_sem, 0.0, 1.0)
+
+            # d_xyz_s = d_xyz / s_xyz
+            # d_emb_s = d_emb / s_emb
+
+            # D_xyz = d_xyz_s / (1.0 + d_xyz_s)
+            # D_emb = d_emb_s / (1.0 + d_emb_s)
+
+            D_xyz = (d_xyz / (s_xyz + 1e-12))
+            D_xyz = D_xyz / (1.0 + D_xyz)
+
+            D_emb = (d_emb / (s_emb + 1e-12))
+            D_emb = D_emb / (1.0 + D_emb)
+
+            D_sem = (d_sem / (s_sem + 1e-12))
+            D_sem = D_sem / (1.0 + D_sem)
+
 
 
             d = D_emb * w_emb + D_xyz * w_dist + w_sem * D_sem
@@ -666,6 +745,7 @@ if __name__ == "__main__":
     embds = np.load(emb_path)
     M, D = embds.shape
     embds_full = np.empty((N, D), dtype=embds.dtype)
+    # embds_full = np.zeros((N, D), dtype=embds.dtype)      # potencjalnie bezpieczniej - sprawdz!
 
     for new_idx, orig_idxs in enumerate(voxel_indices):
         if len(orig_idxs) == 0:
@@ -675,7 +755,7 @@ if __name__ == "__main__":
 
     # parameters for DBSCAN
     min_samples = 20
-    eps = 0.2
+    # eps = 0.55 # 0.3 top for xyz only with scale=median and w=1
    
     A = build_precomputed(
         anchor_points,
@@ -684,11 +764,17 @@ if __name__ == "__main__":
         smoothed_logits,
         k_neighbours
     )
+
+    # output_path = f"./experiments3/model_d{choose_model}k/"+f"wdist={w_dist}_wemb={w_emb}_wsem={w_sem}_eps={eps}_{k_neighbours}"
+    output_path = f"./experiments3/model_d{choose_model}k/wsem_only/"+f"wdist={w_dist}_wemb={w_emb}_wsem={w_sem}_eps={eps}_{k_neighbours}"
+    mesh_save_path = output_path + "/both_segmentations.ply"
+    out_path = Path(output_path)
+    out_path.mkdir(parents=True, exist_ok=True)
     
     labels = DBSCAN(eps=eps, min_samples=min_samples, metric='precomputed').fit_predict(A)
     np.save(output_path+"/instance_ids.npy", labels)
 
-    #labels =  np.load("experiments2_fromsam3/model_d8k/wdist=0.0_wemb=1.0_wsem=0.0_pdist85_pemb78_psem70_512/instance_ids.npy")
+    #labels =  np.load(f"./experiments3/model_d{choose_model}k/"+f"wdist={w_dist}_wemb={w_emb}_wsem={w_sem}_eps={eps}_{k_neighbours}/instance_ids.npy")
     
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     n_noise = int((labels == -1).sum())
@@ -750,7 +836,8 @@ if __name__ == "__main__":
     # vertex_instance_id = labels[idx]
     mesh.vertex_colors = o3d.utility.Vector3dVector(v_colors.astype(np.float64))
 
-    o3d.io.write_triangle_mesh(output_path+f"/wdist={w_dist}_wemb={w_emb}_wsem={w_sem}_pdist{p_dist}_pemb{p_emb}_psem{p_sem}_{k_neighbours}.ply", mesh, write_vertex_colors=True)
+    # o3d.io.write_triangle_mesh(output_path+f"/wdist={w_dist}_wemb={w_emb}_wsem={w_sem}_eps={eps}_{k_neighbours}.ply", mesh, write_vertex_colors=True)
+    o3d.io.write_triangle_mesh(output_path+f"/wdist={w_dist}_wemb={w_emb}_wsem={w_sem}_eps={eps}_{k_neighbours}.ply", mesh, write_vertex_colors=True)
 
     Pi = row_softmax(smoothed_logits)
     # cls_idx = np.full(Pi.shape[0], -2, int)
@@ -763,6 +850,8 @@ if __name__ == "__main__":
     noise = (cls_idx == -1)
     anchors_colors_class[noise] = np.array([0.6, 0.6, 0.6], dtype=np.float64)
 
+    anchor_class_conf = Pi[np.arange(Pi.shape[0]), cls_idx - 1].astype(np.float32)
+
     from scipy.spatial import cKDTree
     kdtree = cKDTree(anchors_transformed)
     verts = np.asarray(mesh.vertices)
@@ -770,9 +859,19 @@ if __name__ == "__main__":
     v_colors = anchors_colors_class[idx] 
     vertex_class_ids = cls_idx[idx]   # important!  because in training I use indices of the list 'classes' whereas in info_semantics ids start from 1
     vertex_instance_id = labels[idx]
+    vertex_class_conf = anchor_class_conf[idx]
+    vertex_class_probs = Pi[idx].astype(np.float16)
     mesh.vertex_colors = o3d.utility.Vector3dVector(v_colors.astype(np.float64))
 
     o3d.io.write_triangle_mesh(output_path+f"/semantic.ply", mesh, write_vertex_colors=True)
+
+    np.savez_compressed(
+        output_path + "/vertex_class_probs.npz",
+        probs=vertex_class_probs,          # (V, K) float16/float32
+        pred_class_id=vertex_class_ids,    # (V,) int32 (opcjonalnie)
+        pred_object_id=vertex_instance_id, # (V,) int32 (opcjonalnie)
+        vertex_index=np.arange(len(vertex_class_ids), dtype=np.int32),  # (V,) (opcjonalnie)
+    )
 
     ## save mesh with class_id and instance_id per vertex
     ply = PlyData.read(output_path+f"/semantic.ply")
@@ -780,9 +879,10 @@ if __name__ == "__main__":
 
     vertex_class_ids = np.asarray(vertex_class_ids, dtype=np.int32)
     vertex_instance_id = np.asarray(vertex_instance_id, dtype=np.int32)
+    vertex_class_conf = np.asarray(vertex_class_conf, dtype=np.float16)
 
     # extend vertex dtype with a new 'class_id' field
-    new_dtype = v.dtype.descr + [("class_id", "i4"), ("instance_id", "i4")]
+    new_dtype = v.dtype.descr + [("class_id", "i4"), ("instance_id", "i4"), ("class_conf", "f4")]
     new_v = np.empty(v.shape[0], dtype=new_dtype)
 
     # copy old fields
@@ -792,6 +892,7 @@ if __name__ == "__main__":
     # set new field
     new_v["class_id"] = vertex_class_ids
     new_v["instance_id"] = vertex_instance_id
+    new_v["class_conf"] = vertex_class_conf
 
     # keep all other elements as they are
     new_vertex_element = PlyElement.describe(new_v, "vertex")
@@ -806,7 +907,7 @@ if __name__ == "__main__":
     ply["vertex"].data = new_v
     new_ply = PlyData(new_elements, text=ply.text)
     new_ply.write(mesh_save_path)
-    print("Saved with per-vertex class_id and instance_id")
+    print("Saved with per-vertex class_id with confidence and instance_id")
 
 
 
@@ -819,24 +920,35 @@ if __name__ == "__main__":
     pred_xyz = anchors_transformed.astype(np.float32)
     pred_cls = cls_idx.astype(np.int32)
     pred_obj = labels.astype(np.int32)
+    pred_conf = anchor_class_conf.astype(np.float16)
 
     # --- map anchors (pred) -> gt vertices via nearest neighbor ---
     tree = cKDTree(pred_xyz)
     dists, nn_idx = tree.query(gt_xyz, k=1)
     mapped_pred_cls = pred_cls[nn_idx].astype(np.int32)  # (N_gt,)
     mapped_pred_obj = pred_obj[nn_idx].astype(np.int32)
+    mapped_pred_conf = pred_conf[nn_idx].astype(np.float16)
+    mapped_pred_probs = Pi[nn_idx].astype(np.float16)  # (N_gt, K)
+
+    np.savez_compressed(
+        output_path + "/mapped_vertex_class_probs_onto_gt.npz",
+        probs=mapped_pred_probs,
+        # pred_class_id=mapped_pred_cls.astype(np.int32),
+        # pred_object_id=mapped_pred_obj.astype(np.int32),
+    )
 
     # --- add/overwrite vertex field "pred_class_id" ---
     old_names = v.dtype.names
-    new_dtype = [(n, v.dtype.fields[n][0]) for n in old_names if n != "pred_class_id" or n != "pred_object_id"] + [("pred_class_id", "i4"), ("pred_object_id", "i4")]
+    new_dtype = [(n, v.dtype.fields[n][0]) for n in old_names if n != "pred_class_id" or n != "pred_object_id"] + [("pred_class_id", "i4"), ("pred_object_id", "i4"), ("pred_class_conf", "f4")]
     v2 = np.empty(v.shape, dtype=new_dtype)
 
     for n in old_names:
-        if n == "pred_class_id" or n == "pred_object_id":
+        if n == "pred_class_id" or n == "pred_object_id" or n == "pred_class_conf":
             continue
         v2[n] = v[n]
     v2["pred_class_id"] = mapped_pred_cls
     v2["pred_object_id"] = mapped_pred_obj
+    v2["pred_class_conf"] = mapped_pred_conf
 
     vertex_el = PlyElement.describe(v2, "vertex")
 

@@ -128,7 +128,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     K = len(classes)
     all_class_idx = list(range(K))
 
-    SEM_DELAY  = 8000    # keep semantics off while geometry forms
+    SEM_DELAY  = 3000    # keep semantics off while geometry forms
     # SEM_DELAY  = 0 
     # SEM_WARMUP = 6000    # linearly ramp over 
     SEM_TARGET = 0.1
@@ -213,7 +213,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             labels_np = npz["labels"]
             # scores_np = npz["scores"]
             if labels_np.size > 0:
-                classes_subset = np.unique(labels_np).tolist()
+                # classes_subset = np.unique(labels_np).tolist()
+                classes_subset = all_class_idx
                 
             #     #per-view:
             #     classes_subset = all_class_idx

@@ -13,4 +13,4 @@ python train.py\
     --sdf_inside_out\
     --eval\
     --sdf_start_iter 15000\
-    -m outputs/final_sam3/d8k_l01
+    -m outputs/final_sam3/d3k_l01_test2

@@ -283,6 +283,61 @@ def contrast_palette2(
 
     return table
 
+def mean_logit_smoothing(
+    anchors_xyz,
+    logits,
+    k=30,
+    self_weight=2.0,
+):
+    """
+    Simple k-NN logit smoothing by arithmetic mean.
+
+    anchors_xyz : (N, 3)
+    logits      : (N, K)
+    """
+
+    N, K = logits.shape
+
+    # k-NN (including self, as in sklearn)
+    nn = NearestNeighbors(n_neighbors=min(k, N)).fit(anchors_xyz)
+    _, nbr_idx = nn.kneighbors(anchors_xyz, return_distance=True)
+
+    # Sum neighbor logits
+    z_neighbors = logits[nbr_idx].sum(axis=1)  # (N, K)
+
+    # Self contribution
+    z_self = self_weight * logits
+
+    # Normalization
+    denom = self_weight + nbr_idx.shape[1]
+
+    z_out = (z_self + z_neighbors) / denom
+    return z_out
+
+colors = (
+    (242,73,73),(109,127,248),(242,221,73),(73,155,242),(242,142,73),
+    (155,73,242),(73,242,242),(242,73,203),(203,242,73),(242,160,203),
+    (244,108,129),(203,191,242),(191,142,73),(242,236,191),(128,38,38),
+    (191,242,203),(142,142,38),(242,209,191),(38,38,128),(210,137,91),
+    (242,38,38),(38,242,38),(38,38,242),(242,242,38),(242,38,242),
+    (38,242,242),(191,191,191),(128,38,128),(202,191,155),(83,128,38),
+    (38,128,83),(38,83,128),(83,38,128),(128,38,83),(191,38,38),
+    (38,191,38),(38,38,191),(191,191,38),(191,38,191),(38,191,191),
+    (102,38,38),(38,102,38),(38,38,102),(102,102,38),(102,38,102),
+    (38,102,102),(157,17,16),(83,166,83),(83,83,166),(166,166,83),
+    (166,83,166),(83,166,166),(204,121,38),(38,204,121),(121,38,204),
+    (204,38,121),(121,204,38),(38,121,204),(153,96,38),(38,153,96),
+    (96,38,153),(153,38,96),(96,153,38),(38,96,153),(242,162,38),
+    (162,242,38),(38,242,162),(38,162,242),(162,38,242),(242,38,162),
+    (204,142,83),(83,204,142),(142,83,204),(204,83,142),(203,235,193),
+    (83,142,204),(242,121,121),(121,242,121),(69,247,172),(242,242,121),
+    (242,121,242),(121,242,242),(64,64,140), (140,64,64),(64,140,64),
+    (191,96,96),(96,191,96),(96,96,191),(191,191,96),(191,96,191),
+    (3,97,104),(77,38,38),(38,77,38),(38,38,77),(77,77,38),
+    (77,38,77), (242,74,190), (182,145,212), (199,206,110), (245,134,71),
+    (27,253,70)
+)
+assert len(colors) == 101
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background, mesh_type="mcube"):
     if mesh_type == "poisson":        
@@ -312,20 +367,34 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
             # cls_idx[mask_conf] = Pi[mask_conf].argmax(axis=1)
 
             # 3
-            logits = gaussians._sem_logits.detach().cpu().numpy()   # [N,K]
-            Pi = softmax(logits, axis=1)                            # [N,K]
-            cls_idx = Pi.argmax(axis=1).astype(int)                 # [N]
+            # logits = gaussians._sem_logits.detach().cpu().numpy()   # [N,K]
+            # Pi = softmax(logits, axis=1)                            # [N,K]
+            # cls_idx = Pi.argmax(axis=1).astype(int)                 # [N]
+            
+            # 4
+            logits = gaussians._sem_logits.detach().cpu().numpy()
+            anchor_xyz = gaussians.get_anchor.detach().cpu().numpy()
+            # smoothed_logits = weighted_logit_mean(anchor_xyz, logits)
+            smoothed_logits = mean_logit_smoothing(anchor_xyz, logits)
+            Pi = row_softmax(smoothed_logits)
+            cls_idx = Pi.argmax(axis=1).astype(np.int32)
         
         anchor_xyz = gaussians.get_anchor.detach().cpu().numpy()
         classes = get_classes()                         # same list used when you constructed GaussianModel
+
+        palette = (np.asarray(colors, dtype=np.float32) / 255.0)  # (101,3) in [0,1]
+
+        cls = cls_idx.copy()
+        cls = np.clip(cls, 0, len(palette) - 1)                   # safety (handles any weird values)
+
+        anchor_colors = palette[cls]    
         # palette = contrast_palette2(classes)         # [K,3] floats in [0,1]
         # anchor_colors = palette[cls_idx] 
         # anchor_colors = palette[np.clip(cls_idx, 0, palette.shape[0]-1)]
 
-        anchor_colors = np.zeros((anchor_xyz.shape[0], 3), dtype=np.float32)
-
-        # cls==60 -> white
-        anchor_colors[cls_idx == 90] = (1.0, 1.0, 1.0)
+        # anchor_colors = np.zeros((anchor_xyz.shape[0], 3), dtype=np.float32)
+        # # cls==60 -> white
+        # anchor_colors[cls_idx == 90] = (1.0, 1.0, 1.0)
 
         # noise = (cls_idx == -1)
         # anchor_colors[noise] = np.array([0.6, 0.6, 0.6], dtype=np.float64)
@@ -372,16 +441,10 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
         v_colors = anchor_colors[idx] 
 
-
-        # n = len(mesh.vertices)
-        # colors = np.tile(np.array([1.0, 0.0, 0.0], dtype=np.float64), (n,1))
         mesh.vertex_colors = o3d.utility.Vector3dVector(v_colors.astype(np.float64))
-        # print("verts:", len(mesh.vertices), "colors:", len(mesh.vertex_colors))
-        # Write the mesh to a file, including vertex colors
-        o3d.io.write_triangle_mesh(os.path.join(model_path, "semantic_mesh_poisson_explicit_d8l0.1_{}".format(iteration)+ ".ply"), mesh, write_vertex_colors=True)
-
-
-        # o3d.io.write_triangle_mesh(os.path.join(model_path, "extracted_mesh_poisson_{}".format(iteration)+ ".ply"), mesh)        
+        
+        o3d.io.write_triangle_mesh(os.path.join(model_path, "semantic_mesh_poisson_mean_d8l0.1_{}".format(iteration)+ ".ply"), mesh, write_vertex_colors=True)
+      
     elif mesh_type == "mcube":
         _ = get_surface_trace(
             path = os.path.join(model_path, "extracted_mesh_marching_cube_{}".format(iteration)+".ply"),

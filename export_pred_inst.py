@@ -152,7 +152,7 @@ def setup_replica_labels(info_semantic_path, valid_ids=None):
 opt = {}
 opt['overlaps']             = np.append(np.arange(0.5,0.95,0.05), 0.25)
 # minimum region size for evaluation [verts]
-opt['min_region_sizes']     = np.array( [ 10 ] ) # 100 for scannet
+opt['min_region_sizes']     = np.array( [ 100 ] ) # 100 for scannet
 # distance thresholds [m]
 opt['distance_threshes']    = np.array( [  float('inf') ] )
 # distance confidences
@@ -345,16 +345,17 @@ def make_pred_info(pred: dict):
     return pred_info
 
 def assign_instances_for_scan_from_meshes(
-    gt_v, pred_v,
+    gt_v, pred_v,pred_ply_path,
     ignore_mask=None,
     gt_class_field="class_id",
     gt_obj_field="object_id",
     pred_class_field="pred_class_id",
     pred_obj_field="pred_object_id",
-    pred_conf_field=None,
+    pred_conf_field="pred_class_conf",
     conf_default=1.0,
 ):
     
+    pred_ply_conf = pred_ply_path
     if ignore_mask is None:
         ignore_mask = np.array([], dtype=np.int32)
     else:
@@ -419,8 +420,8 @@ def assign_instances_for_scan_from_meshes(
             continue
         pred_mask = (pr_obj == oid)
         vert_count = int(pred_mask.sum())
-        # if vert_count < opt["min_region_sizes"][0]:
-        #     continue
+        if vert_count < opt["min_region_sizes"][0]:     # this one filters small predictions, exists in NVSMask3D   
+            continue
 
         # pick semantic label for this predicted instance (mode over its vertices)
         sem_vals = pr_sem[pred_mask]
@@ -478,11 +479,30 @@ def assign_instances_for_scan_from_meshes(
             continue
         label_name = ID_TO_LABEL[label_id]
 
-        # confidence per instance
-        if pr_conf_v is not None:
-            conf = float(np.mean(pr_conf_v[pred_mask]))
-        else:
-            conf = float(conf_default)
+        # # confidence per instance
+        # if pr_conf_v is not None:
+        #     conf = float(np.mean(pr_conf_v[pred_mask]))
+        # else:
+        #     conf = float(conf_default)
+
+        # confidence per instance = mean confidence for the MAJORITY class inside this instance
+        # if pr_conf_v is not None:
+        #     sem_inst = pr_sem[pred_mask]              # per-vertex predicted class in this instance
+        #     conf_inst = pr_conf_v[pred_mask]          # per-vertex confidence in this instance
+
+        #     class_mask = (sem_inst == label_id)       # only vertices that vote for the majority class
+        #     if np.any(class_mask):
+        #         conf = float(np.mean(conf_inst[class_mask]))
+        #     else:
+        #         # fallback (should be rare): average over whole instance or default
+        #         conf = float(np.mean(conf_inst)) if conf_inst.size else float(conf_default)
+        # else:
+        #     conf = float(conf_default)
+
+        z = np.load(pred_ply_conf+"/mapped_vertex_class_probs_onto_gt.npz")
+        probs = z["probs"]              # (V, K)
+        # confidence dla instancji o klasie label_id (ID od 1):
+        conf = probs[pred_mask, label_id - 1].mean()
 
         pred_instance = {
             "uuid": str(uuid4()),  # ScanNet eval uses 'uuid' here
@@ -515,6 +535,7 @@ def assign_instances_for_scan_from_meshes(
 def eval_instance_from_two_meshes(
     gt_ply_path,
     pred_ply_path,
+    mesh_name,
     ignore_mask=None,
     gt_class_field="class_id",
     gt_obj_field="object_id",
@@ -524,10 +545,10 @@ def eval_instance_from_two_meshes(
     conf_default=1.0,
 ):
     gt_v = PlyData.read(gt_ply_path)["vertex"].data
-    pred_v = PlyData.read(pred_ply_path)["vertex"].data
+    pred_v = PlyData.read(pred_ply_path+mesh_name)["vertex"].data
 
     gt2pred, pred2gt = assign_instances_for_scan_from_meshes(
-        gt_v, pred_v,
+        gt_v, pred_v, pred_ply_path,
         ignore_mask=ignore_mask,
         gt_class_field=gt_class_field,
         gt_obj_field=gt_obj_field,
@@ -599,13 +620,127 @@ INFO_SEM = "./data/replica/scan1/info_semantic.json"
 
 # choose which class ids you want to evaluate AP on
 # valid_ids = [1, 2, 3, ...]  # optional subset
-valid_ids = [3, 11, 12, 13, 18, 19, 20, 29, 31, 37, 40, 44, 47, 59, 60, 63, 64, 65, 76, 78, 79, 80, 91, 92, 93, 95, 97, 98]  # exactly valid GT
+# valid_ids = [3, 11, 12, 13, 18, 19, 20, 29, 31, 37, 40, 44, 47, 59, 60, 63, 64, 65, 76, 78, 79, 80, 91, 92, 93, 95, 97, 98]  # exactly valid GT
 # valid_ids = [12, 59]
 
-CLASS_LABELS, VALID_CLASS_IDS, ID_TO_LABEL, LABEL_TO_ID = setup_replica_labels(INFO_SEM, valid_ids)
-gt_ply_path   = "./data/replica/scan1/mesh_semantic_verts_bothids.ply"
-pred_ply_path = "./experiments2_fromsam3/model_d8k/wdist=0.0_wemb=1.0_wsem=0.0_pdist85_pemb78_psem70_512/mapped_semantic_class_id_&_object_id_onto_gt.ply"
+# CLASS_LABELS, VALID_CLASS_IDS, ID_TO_LABEL, LABEL_TO_ID = setup_replica_labels(INFO_SEM, valid_ids)
 
+CLASS_LABELS = [
+    "basket",
+    "bed",
+    "bench",
+    "bin",
+    "blanket",
+    "blinds",
+    "book",
+    "bottle",
+    "box",
+    "bowl",
+    "camera",
+    "cabinet",
+    "candle",
+    "chair",
+    "clock",
+    "cloth",
+    "comforter",
+    "cushion",
+    "desk",
+    "desk-organizer",
+    "door",
+    "indoor-plant",
+    "lamp",
+    "monitor",
+    "nightstand",
+    "panel",
+    "picture",
+    "pillar",
+    "pillow",
+    "pipe",
+    "plant-stand",
+    "plate",
+    "pot",
+    "sculpture",
+    "shelf",
+    "sofa",
+    "stool",
+    "switch",
+    "table",
+    "tablet",
+    "tissue-paper",
+    "tv-screen",
+    "tv-stand",
+    "vase",
+    "vent",
+    "wall-plug",
+    "window",
+    "rug",
+]
+
+VALID_CLASS_IDS = np.asarray(
+    [
+        3,
+        7,
+        8,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        22,
+        23,
+        26,
+        29,
+        34,
+        35,
+        37,
+        44,
+        47,
+        52,
+        54,
+        56,
+        59,
+        60,
+        61,
+        62,
+        63,
+        64,
+        65,
+        70,
+        71,
+        76,
+        78,
+        79,
+        80,
+        82,
+        83,
+        87,
+        88,
+        91,
+        92,
+        95,
+        97,
+        98,
+    ]
+)
+ID_TO_LABEL = {}
+LABEL_TO_ID = {}
+
+for pred_id, i in enumerate(range(len(VALID_CLASS_IDS))):
+    LABEL_TO_ID[CLASS_LABELS[i]] = VALID_CLASS_IDS[i]
+    ID_TO_LABEL[VALID_CLASS_IDS[i]] = CLASS_LABELS[i]
+
+gt_ply_path   = "./data/replica/scan1/mesh_semantic_verts_bothids.ply"
+#pred_ply_path = "./experiments2_fromsam3/model_d8k/wdist=0.0_wemb=1.0_wsem=0.0_pdist85_pemb78_psem70_512/mapped_semantic_class_id_&_object_id_onto_gt.ply"
+
+mesh_name = "/mapped_semantic_class_id_&_object_id_onto_gt.ply"
+
+pred_ply_path = "./experiments3/model_d8k/wsem_only/wdist=0.0_wemb=0.0_wsem=1.0_eps=0.7_512"
 
 # ply = PlyData.read(gt_ply_path)
 # v = ply["vertex"].data
@@ -625,11 +760,11 @@ pred_ply_path = "./experiments2_fromsam3/model_d8k/wdist=0.0_wemb=1.0_wsem=0.0_p
 # ply2.write("./instance_debug_meshes/test.ply")
 
 avgs = eval_instance_from_two_meshes(
-    gt_ply_path, pred_ply_path,
+    gt_ply_path, pred_ply_path, mesh_name,
     gt_class_field="class_id",
     gt_obj_field="object_id",
     pred_class_field="pred_class_id",
     pred_obj_field="pred_object_id",
-    pred_conf_field=None,
+    pred_conf_field="pred_class_conf",
     conf_default=1.0,
 )

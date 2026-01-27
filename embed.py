@@ -48,7 +48,7 @@ for step in range(200):
         view_embedding_sqdists = (view_embedding_pairs[:,0,:] - view_embedding_pairs[:,1,:]).square().sum(dim=1) # what are those indexes :,0,:?
         loss = torch.dot(view_point_matches, view_embedding_sqdists)
         losses.append(loss)        
-        #print(torch.cat((view_pairs, torch.unsqueeze(view_point_matches,1)),1))
+        print(torch.cat((view_pairs, torch.unsqueeze(view_point_matches,1)),1))
     
     # Optimization step
     total_loss = torch.stack(losses).sum()

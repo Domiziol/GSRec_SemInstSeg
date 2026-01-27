@@ -141,17 +141,6 @@ def get_views(scene, skip_train, skip_test):
     views = scene_cameras_train + scene_cameras_test
     return views
 
-def build_covisibility(visible_ids, covis):
-    
-    for a, b in combinations(visible_ids, 2):
-        i, j = (a, b) if a < b else (b, a)
-        covis[(int(i), int(j))] += 1
-
-def build_covisibility_matrix(visible_ids, covis):
-    
-    for a, b in combinations(visible_ids, 2):
-        i, j = (a, b) if a < b else (b, a)
-        covis[int(i), int(j)] += 1
 
 import colorsys
 def palette_from_labels(labels, s=0.65, v=0.95):
@@ -289,11 +278,13 @@ if __name__ == "__main__":
     print(" After: ", len(newpcd2.points))
 
     anchors_downsampled = np.asarray(newpcd2.points)
-    steps = 200
+    steps = 500
 
     # === Training part === 
     anchors_downsampled_id = np.arange(anchors_downsampled.shape[0])
     projection_data = generate_sam_data_for_anchors(anchors_downsampled, all_views, files_path, anchors_downsampled_id)
+
+    loss_history = []
 
     
     proj = torch.from_numpy(projection_data).long()
@@ -335,11 +326,13 @@ if __name__ == "__main__":
         
         # Optimization step
         total_loss = torch.stack(losses).sum()
+        
         optimizer.zero_grad()
         total_loss.backward()
         optimizer.step()
         
-        #print(total_loss)
+        loss_history.append(total_loss.item())
+        print(total_loss)
 
     # Results    
     embds = nn.functional.normalize(embeddings.weight, dim=1).detach().cpu().numpy()
@@ -348,78 +341,23 @@ if __name__ == "__main__":
     np.save(f"embeddings_norm_{voxel_size}_{steps}_withtrace_16k.npy", embds)
     # === End of training ===
 
+    import matplotlib.pyplot as plt
+
+    plt.figure(figsize=(6,4))
+    plt.plot(loss_history)
+    plt.xlabel("Iteration")
+    plt.ylabel("Total loss")
+    plt.title("Training loss")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
 
     # restore (later)
     # embds = np.load(f"embeddings_norm_{voxel_size}_{steps}.npy")
     
     
 
-    # eps = 0.004
-    # min_samples = 5
-    # db = DBSCAN(
-    #     eps=eps,
-    #     min_samples=min_samples,
-    #     metric='cosine',
-    #     algorithm="auto",
-    # )
-    # labels = db.fit_predict(embds)
-    
-    # # ===
-
-    # n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-    # n_noise = int((labels == -1).sum())
-    # print(f"{n_clusters=}, {n_noise=}")
-
-    # palette = contrast_palette(np.unique(labels))
-
-    # N = len(anchor_points)
-    # labels_dense = -np.ones(N, dtype=int)
-    # for i, idxs in enumerate(voxel_indices):
-    #     labels_dense[idxs] = labels[i]
-
-    # anchors_colors = palette[labels]
-    # all_views = get_views(scene, skip_train=args.skip_train, skip_test = args.skip_test)
-
-    # # make noise a neutral gray (optional)
-    # # noise = (labels == -1)
-    # # if noise.any():
-    # #     anchors_colors[noise] = np.array([0, 0, 0], dtype=np.float64)
-
-    # # assign to your downsampled cloud (embeddings were for anchors_downsampled)
-    # # newpcd.colors = o3d.utility.Vector3dVector(anchors_colors)
-
-    # # view
-    # # o3d.visualization.draw_geometries([newpcd])
-
-    # points, color, opaicity,scaling,rot, normal, _, _, _,_ = generate_neural_gaussians_SDF(all_views[0], gaussianModel, visible_mask=None)
-    # points = points.cpu().detach().numpy()
-    # points_normals = torch.nn.functional.normalize(normal).cpu().detach().numpy()
-    # vertices, triangle, pcd2 = poisson_surface_reconstruction(points, points_normals, 8) # 9
-    # import open3d as o3d
-    # mesh = o3d.geometry.TriangleMesh()
-    # mesh.vertices = o3d.utility.Vector3dVector(vertices)
-    # mesh.triangles = o3d.utility.Vector3iVector(triangle)
-    # mesh.vertex_normals = o3d.utility.Vector3dVector(points_normals)
-    # scale_matrix = np.diag([50, 50, 50])
-    # pcd2.points = o3d.utility.Vector3dVector(np.matmul(scale_matrix, np.asarray(pcd2.points).T).T)
-    # normals = np.asarray(pcd2.normals)
-    # scaled_normals =normals * 0.1
-    # pcd2.normals = o3d.utility.Vector3dVector(scaled_normals)
-    # # o3d.visualization.draw_geometries([pcd], point_show_normal=True)
-    # # mesh.compute_vertex_normals()
-    
-    # from scipy.spatial import cKDTree
-    # kdtree = cKDTree(anchors_downsampled)
-    # verts = np.asarray(mesh.vertices)
-    # _, idx = kdtree.query(verts, k=1) 
-
-    
-    # v_colors = anchors_colors[idx]
-    # vc = v_colors.mean(axis=1)
-    # print(np.shape(mesh.vertices), np.shape(v_colors))
-    # mesh.vertex_colors = o3d.utility.Vector3dVector(v_colors.astype(np.float64))
-    
-    # o3d.io.write_triangle_mesh(f"testy_embed/test1.ply", mesh, write_vertex_colors=True)
     
 
 
