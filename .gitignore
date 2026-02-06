@@ -2,6 +2,10 @@
 /outputs/
 __pycache__/
 /sam_model/
+/experiments3/
+/experiments2_fromsam3/
+/trained_embeddings/
+/inst_v2/
 /vdbfusion/
 *.o
 /tmp_build/
