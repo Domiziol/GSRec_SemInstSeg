@@ -740,7 +740,7 @@ gt_ply_path   = "./data/replica/scan1/mesh_semantic_verts_bothids.ply"
 
 mesh_name = "/mapped_semantic_class_id_&_object_id_onto_gt.ply"
 
-pred_ply_path = "./experiments3/model_d8k/wsem_only/wdist=0.0_wemb=0.0_wsem=1.0_eps=0.7_512"
+pred_ply_path = "./experiments3/model_d8k/wdist=0.2_wemb=0.6_wsem=0.2_eps=0.6_512"
 
 # ply = PlyData.read(gt_ply_path)
 # v = ply["vertex"].data

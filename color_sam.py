@@ -7,6 +7,8 @@ import json
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"  # linux; na win podaj ścieżkę do .ttf
 FONT_SIZE = 22
 font = ImageFont.truetype(FONT_PATH, FONT_SIZE)
+FIXED_COL_WIDTH = 260  # px – dobierz raz i koniec
+
 
 # ====== PASTE PATHS HERE ======
 NPZ_DIR = Path("./data/replica/scan1/2Dclassification_tests/test2/results/")
@@ -225,8 +227,10 @@ def render_legend_panel(
 
     # Szerokość kolumny: pad + box + gap + text + pad
     box_text_gap = 12
-    col_w = [pad + box + box_text_gap + tw + pad for tw in col_text_max]
-    panel_w = sum(col_w) + col_gap * (ncols - 1)
+    # col_w = [pad + box + box_text_gap + tw + pad for tw in col_text_max]
+    # panel_w = sum(col_w) + col_gap * (ncols - 1)
+    col_w = [FIXED_COL_WIDTH for _ in range(ncols)]
+    panel_w = ncols * FIXED_COL_WIDTH + col_gap * (ncols - 1)
     panel_h = pad * 2 + row * nrows
 
     panel = Image.new("RGB", (panel_w, panel_h), bg)

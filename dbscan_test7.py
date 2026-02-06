@@ -592,11 +592,11 @@ if __name__ == "__main__":
     a_dist = 0.6
     a_emb = 0.2
 
-    w_dist = 0.0    # if 1, eps = 0.2 is quite nice, 90th
-    w_emb = 0.0     # if 1, eps = 0.12, 0.15 is quite nice, 90th
-    w_sem = 1.0    # if 1, eps = 0.05 is quite nice, 90th
+    w_dist = 0.2    # if 1, eps = 0.2 is quite nice, 90th
+    w_emb = 0.6     # if 1, eps = 0.12, 0.15 is quite nice, 90th
+    w_sem = 0.2    # if 1, eps = 0.05 is quite nice, 90th
 
-    eps = 0.7
+    eps = 0.6
 
     # percentiles for scale calculations (lower percentile -> lower eps -> more clusters)
     # p_dist = 85
@@ -765,8 +765,8 @@ if __name__ == "__main__":
         k_neighbours
     )
 
-    # output_path = f"./experiments3/model_d{choose_model}k/"+f"wdist={w_dist}_wemb={w_emb}_wsem={w_sem}_eps={eps}_{k_neighbours}"
-    output_path = f"./experiments3/model_d{choose_model}k/wsem_only/"+f"wdist={w_dist}_wemb={w_emb}_wsem={w_sem}_eps={eps}_{k_neighbours}"
+    # # output_path = f"./experiments3/model_d{choose_model}k/"+f"wdist={w_dist}_wemb={w_emb}_wsem={w_sem}_eps={eps}_{k_neighbours}"
+    output_path = f"./experiments3/model_d{choose_model}k/wemb+wsem/"+f"wdist={w_dist}_wemb={w_emb}_wsem={w_sem}_eps={eps}_{k_neighbours}"
     mesh_save_path = output_path + "/both_segmentations.ply"
     out_path = Path(output_path)
     out_path.mkdir(parents=True, exist_ok=True)

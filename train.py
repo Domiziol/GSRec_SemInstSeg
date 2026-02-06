@@ -108,9 +108,6 @@ def get_classes():
     for objects in data['classes']:
         classes.append(objects['name'])
 
-    # device = "cuda" if torch.cuda.is_available() else "cpu"
-    # clip_model, clip_preprocess = clip.load("ViT-B/16", device=device)
-
     return classes
 
 def score_to_weight(scores, lo=0.20, hi=0.35, w_min=0.10):
