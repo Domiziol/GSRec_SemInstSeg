@@ -1,7 +1,8 @@
 from pathlib import Path
 import numpy as np
-
 from plyfile import PlyData, PlyElement
+
+
 colors = (
     (242,73,73),(109,127,248),(106, 45, 110),(73,155,242),(242,142,73),
     (155,73,242),(73,242,242),(242,73,203),(203,242,73),(242,160,203),
@@ -57,84 +58,68 @@ colors = (
 # 65: 100, 76, 209
 assert len(colors) == 101
 
-def color_ply_vertices_by_class_id(
-    ply_path: str | Path,
-    class_field: str = "class_id",
-    indexed_plus_one: bool = True,
-    ignore_ids=(-1, -2),
-    ignore_color=(0, 0, 0),   # color for ignored vertices
-):
-    ply_path = Path(ply_path)
-    out_path = ply_path.with_name(ply_path.stem + "_colored_semanticpred" + ply_path.suffix)
+def ColorPlyByID(plyPath, IDName, shift, ignoreID):
 
-    ply = PlyData.read(str(ply_path))
-    if "vertex" not in ply:
-        raise ValueError("PLY has no 'vertex' element.")
+    plyPath = Path(plyPath)
+    outputMeshPath = plyPath.with_name(plyPath.stem + "_colored_semanticpred" + plyPath.suffix)
 
-    v = ply["vertex"].data  # structured array
+    plyFile = PlyData.read(str(plyPath))
+    vertexData = plyFile["vertex"].data
 
-    if class_field not in v.dtype.names:
-        raise ValueError(f"Vertex property '{class_field}' not found. Available: {v.dtype.names}")
+    if IDName not in vertexData.dtype.names:
+        print(f"'{IDName}' not found")
 
-    class_ids = v[class_field].astype(np.int64)
+    classIds = vertexData[IDName].astype(np.int64)
 
-    # ign = np.isin(class_ids, np.array(ignore_ids, dtype=np.int64))
+    if shift:
+        classIds = classIds - 1
 
-    if indexed_plus_one:
-        class_ids = class_ids - 1
+    
 
-    ign = np.isin(class_ids, np.array(ignore_ids, dtype=np.int64))
-
+    isIgnore = np.isin(classIds, np.array(ignoreID, dtype=np.int64))
     palette = np.asarray(colors, dtype=np.uint8)  # (101,3)
 
-    rgb = np.empty((len(v), 3), dtype=np.uint8)
-    rgb[ign] = np.array(ignore_color, dtype=np.uint8)
 
-    ok = ~ign
-    if ok.any():
-        ok_ids = class_ids[ok]
-        if ok_ids.min() < 0 or ok_ids.max() >= len(colors):
-            raise ValueError(
-                f"class_id out of range after shift (excluding ignored): "
-                f"min={ok_ids.min()} max={ok_ids.max()} palette_len={len(colors)}"
-            )
-        rgb[ok] = palette[ok_ids]
+    newVertexColor = np.empty((len(vertexData), 3), dtype=np.uint8)
+    newVertexColor[isIgnore] = np.array((0, 0, 0), dtype=np.uint8)
 
-    # Build new vertex dtype (preserve everything, ensure RGB exists)
-    names = list(v.dtype.names)
-    new_descr = list(v.dtype.descr)
+    isValid = ~isIgnore
+    if isValid.any():
+        validIds = classIds[isValid]
+
+        newVertexColor[isValid] = palette[validIds]
+
+    
+    oldVertexData = list(vertexData.dtype.names)
+    newDesc = list(vertexData.dtype.descr)
+
+    # add color descriptor if doesn't exists yet
     for c in ("red", "green", "blue"):
-        if c not in names:
-            new_descr.append((c, "u1"))
+        if c not in oldVertexData:
+            newDesc.append((c, "u1"))
 
-    v2 = np.empty(v.shape, dtype=new_descr)
-    for n in names:
-        v2[n] = v[n]
+    newVertex = np.empty(vertexData.shape, dtype=newDesc)
+    for n in oldVertexData:
+        newVertex[n] = vertexData[n]
 
-    v2["red"]   = rgb[:, 0]
-    v2["green"] = rgb[:, 1]
-    v2["blue"]  = rgb[:, 2]
+    newVertex["red"] = newVertexColor[:, 0]
+    newVertex["green"]= newVertexColor[:, 1]
+    newVertex["blue"] = newVertexColor[:, 2]
 
-    elements = []
-    for el in ply.elements:
-        if el.name == "vertex":
-            elements.append(PlyElement.describe(v2, "vertex"))
+    plyData = []
+    for i in plyFile.elements:
+        if i.name == "vertex":
+            plyData.append(PlyElement.describe(newVertex, "vertex"))
         else:
-            elements.append(el)
+            plyData.append(i)
 
-    PlyData(elements, text=ply.text).write(str(out_path))
-    return out_path
-
-
+    PlyData(plyData, text=plyFile.text).write(str(outputMeshPath))
+    
 
 if __name__ == "__main__":
 
-    # gt_mesh_path = "./data/replica/scan1/mesh_semantic_verts_bothids.ply"
-    gt_mesh_path = "/home/domi/repos/3dgs/GSRec_SemInstSeg/experiments3/model_d8k/wsem_only/wsem=1.0_eps=0.2_512/both_segmentations.ply"
-    out = color_ply_vertices_by_class_id(
-        gt_mesh_path,
-        class_field="class_id",
-        indexed_plus_one=True,
-        ignore_ids=(-1, -2)
-    )
-    print("Saved:", out)
+    # meshPath = "./data/replica/scan1/mesh_semantic_verts_bothids.ply"
+    meshPath = "/home/domi/repos/3dgs/GSRec_SemInstSeg/experiments3/model_d8k/wsem_only/wsem=1.0_eps=0.2_512/both_segmentations.ply"
+
+    ColorPlyByID(meshPath, IDName="class_id", shift=True, ignore=(-1, -2))
+    
