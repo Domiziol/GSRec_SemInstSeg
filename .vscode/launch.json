@@ -37,8 +37,8 @@
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
             "args": [
-                "--model_path=outputs/final/d8000_l0.1_maskswithbackground_detached/",
-                "--checkpoint_path=outputs/final/d8000_l0.1_maskswithbackground_detached/chkpnt30000.pth"
+                "--model_path=./outputs/final_sam3/d8k_l01/",
+                "--checkpoint_path=./outputs/final_sam3/d8k_l01/chkpnt30000.pth"
             ]
         },
         {
