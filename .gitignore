@@ -6,6 +6,9 @@ __pycache__/
 /experiments2_fromsam3/
 /trained_embeddings/
 /inst_v2/
+/mesh_testy/
+/instance_debug_meshes/
+/inst_downsampled/
 /vdbfusion/
 *.o
 /tmp_build/
