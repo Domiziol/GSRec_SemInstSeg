@@ -247,11 +247,11 @@ def compute_averages(aps):
 
 def assign_instances_from_meshes(
     gt_v, pred_v,pred_ply_path,
-    ignore_mask=None,
-    gt_class_field="class_id",
-    gt_inst_field="object_id",
-    pred_class_field="pred_class_id",
-    pred_inst_field="pred_object_id",
+    ignore_mask,
+    gt_class_field,
+    gt_inst_field,
+    pred_class_field,
+    pred_inst_field,
 ):
     
     pred_ply_conf = pred_ply_path
@@ -263,20 +263,20 @@ def assign_instances_from_meshes(
    
     gt_sem = gt_v[gt_class_field].astype(np.int32)
     gt_inst = gt_v[gt_inst_field].astype(np.int32)
-    pr_sem = pred_v[pred_class_field].astype(np.int32)
-    pr_inst = pred_v[pred_inst_field].astype(np.int32)
+    pred_sem = pred_v[pred_class_field].astype(np.int32)
+    pred_inst = pred_v[pred_inst_field].astype(np.int32)
 
 
     vtx_idx = np.arange(len(gt_sem))
     keep_vtx = ~np.isin(vtx_idx, ignore_mask)
 
     gt_sem, gt_inst = gt_sem[keep_vtx], gt_inst[keep_vtx]
-    pr_sem, pr_inst = pr_sem[keep_vtx], pr_inst[keep_vtx]
+    pred_sem, pred_inst = pred_sem[keep_vtx], pred_inst[keep_vtx]
 
     
     gt_ids = np.zeros_like(gt_sem, dtype=np.int32)
-    ok_gt = (gt_sem > 0) & (gt_inst >= 0)
-    gt_ids[ok_gt] = gt_sem[ok_gt] * 1000 + gt_inst[ok_gt]
+    validGT = (gt_sem > 0) & (gt_inst >= 0)
+    gt_ids[validGT] = gt_sem[validGT] * 1000 + gt_inst[validGT]
 
     gt_instances = {name: [] for name in CLASS_LABELS}
     for inst_id in np.unique(gt_ids):
@@ -285,8 +285,8 @@ def assign_instances_from_meshes(
         sem_id = int(inst_id // 1000)
         if sem_id not in VALID_CLASS_IDS:
             continue
-        label_name = ID_TO_LABEL[sem_id]
-        gt_instances[label_name].append({
+        label = ID_TO_LABEL[sem_id]
+        gt_instances[label].append({
             "instance_id": int(inst_id),
             "label_id": int(sem_id),
             "vert_count": int((gt_ids == inst_id).sum()),
@@ -295,24 +295,24 @@ def assign_instances_from_meshes(
         })
 
     gt2pred = deepcopy(gt_instances)
-    for label_name in gt2pred:
-        for gt_inst in gt2pred[label_name]:
+    for label in gt2pred:
+        for gt_inst in gt2pred[label]:
             gt_inst["matched_pred"] = []
 
-    pred2gt = {label_name: [] for label_name in CLASS_LABELS}
+    pred2gt = {label: [] for label in CLASS_LABELS}
     bool_void = ~np.isin(gt_ids // 1000, VALID_CLASS_IDS)
    
     num_pred_instances = 0
-    for oid in np.unique(pr_inst):
+    for oid in np.unique(pred_inst):
         if oid < 0:
             continue
-        pred_mask = (pr_inst == oid)
+        pred_mask = (pred_inst == oid)
         vert_count = int(pred_mask.sum())
         if vert_count < opt["min_region_sizes"][0]: 
             continue
 
         
-        sem_vals = pr_sem[pred_mask]
+        sem_vals = pred_sem[pred_mask]
         sem_vals = sem_vals[sem_vals > 0]
         if sem_vals.size == 0:
             continue
@@ -320,7 +320,7 @@ def assign_instances_from_meshes(
         
         if label_id not in ID_TO_LABEL:
             continue
-        label_name = ID_TO_LABEL[label_id]
+        label = ID_TO_LABEL[label_id]
 
 
         probs_file = np.load(pred_ply_conf+"/mapped_vertex_class_probs_onto_gt.npz")
@@ -340,7 +340,7 @@ def assign_instances_from_meshes(
         num_pred_instances += 1
 
         # match against GT instances of same class
-        for gt_num, gt_inst in enumerate(gt2pred[label_name]):
+        for gt_num, gt_inst in enumerate(gt2pred[label]):
             gt_mask = (gt_ids == gt_inst["instance_id"])
             inter = int(np.count_nonzero(gt_mask & pred_mask))
             if inter > 0:
@@ -350,9 +350,9 @@ def assign_instances_from_meshes(
                 pred_copy["intersection"] = inter
 
                 pred_instance["matched_gt"].append(gt_copy)
-                gt2pred[label_name][gt_num]["matched_pred"].append(pred_copy)
+                gt2pred[label][gt_num]["matched_pred"].append(pred_copy)
 
-        pred2gt[label_name].append(pred_instance)
+        pred2gt[label].append(pred_instance)
 
     return gt2pred, pred2gt
 
