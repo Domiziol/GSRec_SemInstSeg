@@ -1,3 +1,5 @@
+# THESIS
+
 # adapted from https://github.com/cvg/nice-slam
 import argparse
 import random

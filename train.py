@@ -1,3 +1,4 @@
+# # THESIS - modified original GSrec script
 #
 # Copyright (C) 2023, Inria
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
@@ -8,6 +9,8 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
+
+# Thesis: modified original script from GSrec
 
 
 import os
@@ -87,6 +90,7 @@ def saveRuntimeCode(dst: str) -> None:
     
     print('Backup Finished!')
 
+## THESIS
 def get_classes():
     classes= []
 
@@ -97,10 +101,11 @@ def get_classes():
         classes.append(objects['name'])
 
     return classes
+# ===
     
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None, vis=False, k_near=50, sampling_numbers=8192, learn_sdf=False):
     
-    # semantic
+    ## THESIS
     classes = get_classes()
     if not hasattr(opt, "lambda_sem"):
         opt.lambda_sem = 0.0
@@ -109,6 +114,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
     SEM_DELAY  = 8000
     SEM_TARGET = 0.1
+    # ===
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -131,12 +137,16 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):      
 
+        ## THESIS
         if iteration <= SEM_DELAY:
             lambda_sem = 0.0
         else:
             lambda_sem = SEM_TARGET
 
         opt.lambda_sem = lambda_sem
+        # ===
+
+
         # if network_gui.conn == None:
         #     network_gui.try_connect()
         # while network_gui.conn != None:
@@ -165,7 +175,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
-        
+        ## THESIS
         samResultsPath = "./data/replica/scan1/2Dclassification_tests/test1/results/"
         image_name = viewpoint_cam.image_name
         base = os.path.splitext(image_name)[0]
@@ -187,6 +197,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 classes_subset = classIds
             # else:
             #     classes_subset = None  
+        # ===
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad, class_subset = classes_subset)
         
@@ -195,6 +206,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         render_depth, render_normal, render_median_depth = render_pkg["render_depth"], render_pkg["render_normal"], render_pkg["render_median_depth"]
 
+        ## THESIS
         # semantic loss (cross entropy)
         probs_sem = render_pkg["semantics"]
         sem_loss = torch.tensor(0.0, device=image.device)
@@ -226,7 +238,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         ignore_index=IGNORE,
                         reduction="mean"
                     )
-        
+        # ====
+
         # monocular depth loss
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image*viewpoint_cam.mask.cuda(), gt_image) if opt.use_mask_for_rgb else l1_loss(image, gt_image)
@@ -316,7 +329,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         loss += opt.lambda_render_norm_reg * normal_grad_loss 
         loss += sdf_loss
 
+        ## THESIS
         loss += opt.lambda_sem * sem_loss   # semantic
+        # ===
         
         if torch.isnan(loss):
             print(viewspace_point_tensor.grad)

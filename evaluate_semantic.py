@@ -1,3 +1,6 @@
+## owner: Dominika Ziolkiewicz
+
+## THESIS
 import numpy as np
 import json
 from plyfile import PlyData

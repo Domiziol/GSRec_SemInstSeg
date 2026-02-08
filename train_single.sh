@@ -1,3 +1,4 @@
+# GSrec original
 #!/bin/bash
 python train.py\
     --gpu 0\

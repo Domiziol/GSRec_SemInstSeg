@@ -1,3 +1,6 @@
+## owner: Dominika Ziolkiewicz
+
+## THESIS
 import torch
 import numpy as np
 from scene import Scene

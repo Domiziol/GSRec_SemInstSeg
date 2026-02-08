@@ -1,3 +1,6 @@
+# THESIS - modified Scannet++ original eval_inst script
+
+
 # Evaluates semantic instance task
 # Adapted from the CityScapes evaluation: https://github.com/mcordts/cityscapesScripts/tree/master/cityscapesscripts/evaluation
 # Input:

@@ -1,3 +1,6 @@
+## owner: Dominika Ziolkiewicz
+
+## THESIS
 from pathlib import Path
 import numpy as np
 from plyfile import PlyData, PlyElement

@@ -1,3 +1,4 @@
+# THESIS - modified original GSrec script
 import os
 import torch
 
