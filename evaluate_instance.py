@@ -26,110 +26,22 @@
 # example usage: evaluate_semantic_instance.py --scan_path [path to scan data] --output_file [output file]
 
 # python imports
-import math
-import os, sys, argparse
-import inspect
+import os, sys
 from copy import deepcopy
 from uuid import uuid4
 from plyfile import PlyData
-import json
-import torch
-from plyfile import PlyData, PlyElement
+
+from plyfile import PlyData
 try:
     import numpy as np
 except:
     print("Failed to import numpy package.")
     sys.exit(-1)
 
-from scipy import stats
-
-def save_colored_instance_ply(
-    base_ply_path: str,
-    out_ply_path: str,
-    instance_mask: np.ndarray,
-    gt_mask: np.ndarray | None = None,
-    dim_color=(120, 120, 120),
-    inst_color=(255, 60, 60),
-    gt_color=(60, 255, 60),
-):
-    """
-    Saves a colored copy of base_ply_path:
-      - dim_color for all vertices
-      - inst_color for instance_mask
-      - gt_color for gt_mask (optional). If both overlap, instance color wins.
-    Works for typical ScanNet-like PLYs with vertex x,y,z.
-    """
-    ply = PlyData.read(base_ply_path)
-    v = ply["vertex"].data
-
-    n = len(v)
-    instance_mask = np.asarray(instance_mask, dtype=bool)
-    assert instance_mask.shape[0] == n, f"mask length {instance_mask.shape[0]} != n_verts {n}"
-
-    if gt_mask is not None:
-        gt_mask = np.asarray(gt_mask, dtype=bool)
-        assert gt_mask.shape[0] == n
-
-    # Build new vertex dtype with rgb if missing
-    names = v.dtype.names
-    has_rgb = all(k in names for k in ("red", "green", "blue"))
-
-    if has_rgb:
-        v2 = v.copy()
-    else:
-        # create extended dtype
-        new_dtype = v.dtype.descr + [("red", "u1"), ("green", "u1"), ("blue", "u1")]
-        v2 = np.empty(n, dtype=new_dtype)
-        for name in names:
-            v2[name] = v[name]
-
-    # paint everything dim first
-    v2["red"] = np.uint8(dim_color[0])
-    v2["green"] = np.uint8(dim_color[1])
-    v2["blue"] = np.uint8(dim_color[2])
-
-    # optionally paint GT overlap region
-    if gt_mask is not None:
-        v2["red"][gt_mask] = np.uint8(gt_color[0])
-        v2["green"][gt_mask] = np.uint8(gt_color[1])
-        v2["blue"][gt_mask] = np.uint8(gt_color[2])
-
-    # paint predicted instance (wins if overlaps)
-    v2["red"][instance_mask] = np.uint8(inst_color[0])
-    v2["green"][instance_mask] = np.uint8(inst_color[1])
-    v2["blue"][instance_mask] = np.uint8(inst_color[2])
-
-    # Write out: preserve other elements (faces) if present
-    new_elems = []
-    for e in ply.elements:
-        if e.name == "vertex":
-            new_elems.append(PlyElement.describe(v2, "vertex"))
-        else:
-            new_elems.append(e)
-
-    PlyData(new_elems, text=False).write(out_ply_path)
-    print(f"[saved] {out_ply_path}")
 
 
 
-def setup_replica_labels(info_semantic_path, valid_ids=None):
-   
-    data = json.load(open(info_semantic_path, "r"))
-    names0 = [c["name"].replace("_", " ") for c in data["classes"]]  # len K
-
-    K = len(names0)
-    if valid_ids is None:
-        valid_ids = list(range(1, K + 1))  # all classes 1..K
-
-    CLASS_LABELS = [names0[i - 1] for i in valid_ids]
-    VALID_CLASS_IDS = np.array(valid_ids, dtype=np.int32)
-
-    ID_TO_LABEL = {cid: names0[cid - 1] for cid in valid_ids}
-    LABEL_TO_ID = {names0[cid - 1]: cid for cid in valid_ids}
-
-    return CLASS_LABELS, VALID_CLASS_IDS, ID_TO_LABEL, LABEL_TO_ID
-
-
+# Scannet part - not used 
 #parser = argparse.ArgumentParser()
 #parser.add_argument('--gt_path', default='', help='path to directory of gt .txt files')
 #parser.add_argument('--output_file', default='', help='output file [default: ./semantic_instance_evaluation.txt]')
@@ -332,27 +244,14 @@ def compute_averages(aps):
         avg_dict["classes"][label_name]["ap25%"]    = np.average(aps[ d_inf,li,o25])
     return avg_dict
 
-def make_pred_info(pred: dict):
-    # pred = {'pred_scores' = 100, 'pred_classes' = 100 'pred_masks' = Nx100}
-    pred_info = {}
-    assert(pred['pred_classes'].shape[0] == pred['pred_scores'].shape[0] == pred['pred_masks'].shape[1])
-    for i in range(len(pred['pred_classes'])):
-        info = {}
-        info["label_id"] = pred['pred_classes'][i]
-        info["conf"] = pred['pred_scores'][i]
-        info["mask"] = pred['pred_masks'][:,i]
-        pred_info[uuid4()] = info # we later need to identify these objects
-    return pred_info
 
-def assign_instances_for_scan_from_meshes(
+def assign_instances_from_meshes(
     gt_v, pred_v,pred_ply_path,
     ignore_mask=None,
     gt_class_field="class_id",
-    gt_obj_field="object_id",
+    gt_inst_field="object_id",
     pred_class_field="pred_class_id",
-    pred_obj_field="pred_object_id",
-    pred_conf_field="pred_class_conf",
-    conf_default=1.0,
+    pred_inst_field="pred_object_id",
 ):
     
     pred_ply_conf = pred_ply_path
@@ -361,31 +260,24 @@ def assign_instances_for_scan_from_meshes(
     else:
         ignore_mask = np.asarray(ignore_mask, dtype=np.int32)
 
-    # --- read fields ---
+   
     gt_sem = gt_v[gt_class_field].astype(np.int32)
-    gt_obj = gt_v[gt_obj_field].astype(np.int32)
+    gt_inst = gt_v[gt_inst_field].astype(np.int32)
     pr_sem = pred_v[pred_class_field].astype(np.int32)
-    pr_obj = pred_v[pred_obj_field].astype(np.int32)
+    pr_inst = pred_v[pred_inst_field].astype(np.int32)
 
-    # --- apply ignore mask (same semantics as original) ---
+
     vtx_idx = np.arange(len(gt_sem))
     keep_vtx = ~np.isin(vtx_idx, ignore_mask)
 
-    gt_sem, gt_obj = gt_sem[keep_vtx], gt_obj[keep_vtx]
-    pr_sem, pr_obj = pr_sem[keep_vtx], pr_obj[keep_vtx]
+    gt_sem, gt_inst = gt_sem[keep_vtx], gt_inst[keep_vtx]
+    pr_sem, pr_inst = pr_sem[keep_vtx], pr_inst[keep_vtx]
 
-    # optional per-vertex confidence
-    if pred_conf_field is not None and pred_conf_field in pred_v.dtype.names:
-        pr_conf_v = pred_v[pred_conf_field].astype(np.float32)[keep_vtx]
-    else:
-        pr_conf_v = None
-
-    # --- build ScanNet-style GT instance ids: sem*1000 + inst ---
+    
     gt_ids = np.zeros_like(gt_sem, dtype=np.int32)
-    ok_gt = (gt_sem > 0) & (gt_obj >= 0)   # negatives => void (0)
-    gt_ids[ok_gt] = gt_sem[ok_gt] * 1000 + gt_obj[ok_gt]
+    ok_gt = (gt_sem > 0) & (gt_inst >= 0)
+    gt_ids[ok_gt] = gt_sem[ok_gt] * 1000 + gt_inst[ok_gt]
 
-    # --- init GT instances per class (ScanNet style) ---
     gt_instances = {name: [] for name in CLASS_LABELS}
     for inst_id in np.unique(gt_ids):
         if inst_id == 0:
@@ -408,104 +300,36 @@ def assign_instances_for_scan_from_meshes(
             gt_inst["matched_pred"] = []
 
     pred2gt = {label_name: [] for label_name in CLASS_LABELS}
-
-    # invalid GT semantic mask (used to compute void_intersection)
     bool_void = ~np.isin(gt_ids // 1000, VALID_CLASS_IDS)
-
-    # debug_class_id = 97
-    # --- build predicted instances from pred_object_id (one instance per object_id) ---
+   
     num_pred_instances = 0
-    for oid in np.unique(pr_obj):
+    for oid in np.unique(pr_inst):
         if oid < 0:
             continue
-        pred_mask = (pr_obj == oid)
+        pred_mask = (pr_inst == oid)
         vert_count = int(pred_mask.sum())
-        if vert_count < opt["min_region_sizes"][0]:     # this one filters small predictions, exists in NVSMask3D   
+        if vert_count < opt["min_region_sizes"][0]: 
             continue
 
-        # pick semantic label for this predicted instance (mode over its vertices)
+        
         sem_vals = pr_sem[pred_mask]
         sem_vals = sem_vals[sem_vals > 0]
         if sem_vals.size == 0:
             continue
         label_id = int(np.bincount(sem_vals).argmax())  # mode
-        # ===
-        # if debug_class_id is not None and label_id == debug_class_id:
-        #     print(f"\n[PRED inst oid={oid}] label_id={label_id} vert_count={vert_count}")
-
-        #     # show top-5 semantic votes inside this instance
-        #     bc = np.bincount(sem_vals)
-        #     top = np.argsort(bc)[::-1][:5]
-        #     top = [(int(k), int(bc[k])) for k in top if bc[k] > 0]
-        #     print("  vote top:", top)
-
-        #     print("  void_intersection:", int(np.count_nonzero(bool_void & pred_mask)))
-        #     out_dir = "./instance_debug_meshes"
-        #     os.makedirs(out_dir, exist_ok=True)
-
-        #     # IMPORTANT: pred_mask here is on the *filtered* vertex set (keep_vtx applied).
-        #     # We need a mask on the *original* vertex indexing to write colors correctly.
-        #     full_pred_mask = np.zeros(len(pred_v[pred_class_field]), dtype=bool)  # careful: pred_v is structured array
-        #     full_pred_mask[keep_vtx] = pred_mask
-
-        #     # Optionally, also color the best-overlapping GT instance (green)
-        #     best_gt_mask_full = None
-        #     best_iou = -1.0
-
-        #     best_gt_id = None
-        #     best_inter = 0
-        #     best_union = 0
-
-        #     for gt in gt2pred[label_name]:
-        #         gt_mask_small = (gt_ids == gt["instance_id"])   # this is on filtered vertices
-        #         inter = np.count_nonzero(gt_mask_small & pred_mask)
-        #         if inter == 0:
-        #             continue
-        #         union = gt["vert_count"] + vert_count - inter
-        #         iou = inter / union
-        #         if iou > best_iou:
-        #             best_iou = iou
-        #             best_gt_id = gt["instance_id"]
-        #             best_inter = int(inter)
-        #             best_union = int(union)
-        #             best_gt_mask_full = np.zeros(len(full_pred_mask), dtype=bool)
-        #             best_gt_mask_full[keep_vtx] = gt_mask_small
-        #     if best_iou < 0:
-        #         print("  best_iou: (no GT intersection)")
-        #     else:
-        #         print(f"  best_iou: {best_iou:.6f} (GT inst {best_gt_id}, inter={best_inter}, union={best_union})")
-        # ===
+        
         if label_id not in ID_TO_LABEL:
             continue
         label_name = ID_TO_LABEL[label_id]
 
-        # # confidence per instance
-        # if pr_conf_v is not None:
-        #     conf = float(np.mean(pr_conf_v[pred_mask]))
-        # else:
-        #     conf = float(conf_default)
 
-        # confidence per instance = mean confidence for the MAJORITY class inside this instance
-        # if pr_conf_v is not None:
-        #     sem_inst = pr_sem[pred_mask]              # per-vertex predicted class in this instance
-        #     conf_inst = pr_conf_v[pred_mask]          # per-vertex confidence in this instance
-
-        #     class_mask = (sem_inst == label_id)       # only vertices that vote for the majority class
-        #     if np.any(class_mask):
-        #         conf = float(np.mean(conf_inst[class_mask]))
-        #     else:
-        #         # fallback (should be rare): average over whole instance or default
-        #         conf = float(np.mean(conf_inst)) if conf_inst.size else float(conf_default)
-        # else:
-        #     conf = float(conf_default)
-
-        z = np.load(pred_ply_conf+"/mapped_vertex_class_probs_onto_gt.npz")
-        probs = z["probs"]              # (V, K)
-        # confidence dla instancji o klasie label_id (ID od 1):
+        probs_file = np.load(pred_ply_conf+"/mapped_vertex_class_probs_onto_gt.npz")
+        probs = probs_file["probs"]
+        
         conf = probs[pred_mask, label_id - 1].mean()
 
         pred_instance = {
-            "uuid": str(uuid4()),  # ScanNet eval uses 'uuid' here
+            "uuid": str(uuid4()),
             "pred_id": num_pred_instances,
             "label_id": int(label_id),
             "vert_count": vert_count,
@@ -538,24 +362,20 @@ def eval_instance_from_two_meshes(
     mesh_name,
     ignore_mask=None,
     gt_class_field="class_id",
-    gt_obj_field="object_id",
+    gt_inst_field="object_id",
     pred_class_field="pred_class_id",
-    pred_obj_field="pred_object_id",
-    pred_conf_field=None,
-    conf_default=1.0,
+    pred_inst_field="pred_object_id",
 ):
     gt_v = PlyData.read(gt_ply_path)["vertex"].data
     pred_v = PlyData.read(pred_ply_path+mesh_name)["vertex"].data
 
-    gt2pred, pred2gt = assign_instances_for_scan_from_meshes(
+    gt2pred, pred2gt = assign_instances_from_meshes(
         gt_v, pred_v, pred_ply_path,
         ignore_mask=ignore_mask,
         gt_class_field=gt_class_field,
-        gt_obj_field=gt_obj_field,
+        gt_inst_field=gt_inst_field,
         pred_class_field=pred_class_field,
-        pred_obj_field=pred_obj_field,
-        pred_conf_field=pred_conf_field,
-        conf_default=conf_default,
+        pred_inst_field=pred_inst_field
     )
 
     matches = {os.path.abspath(gt_ply_path): {"gt": gt2pred, "pred": pred2gt}}
@@ -617,13 +437,6 @@ def write_result_file(avgs, filename):
 
 
 INFO_SEM = "./data/replica/scan1/info_semantic.json"
-
-# choose which class ids you want to evaluate AP on
-# valid_ids = [1, 2, 3, ...]  # optional subset
-# valid_ids = [3, 11, 12, 13, 18, 19, 20, 29, 31, 37, 40, 44, 47, 59, 60, 63, 64, 65, 76, 78, 79, 80, 91, 92, 93, 95, 97, 98]  # exactly valid GT
-# valid_ids = [12, 59]
-
-# CLASS_LABELS, VALID_CLASS_IDS, ID_TO_LABEL, LABEL_TO_ID = setup_replica_labels(INFO_SEM, valid_ids)
 
 CLASS_LABELS = [
     "basket",
@@ -742,29 +555,10 @@ mesh_name = "/mapped_semantic_class_id_&_object_id_onto_gt.ply"
 
 pred_ply_path = "./experiments3/model_d8k/wdist=0.2_wemb=0.6_wsem=0.2_eps=0.6_512"
 
-# ply = PlyData.read(gt_ply_path)
-# v = ply["vertex"].data
-# print(np.unique(v["class_id"].astype(np.int32)))
-# # ensure RGB fields exist
-# if not all(k in v.dtype.names for k in ("red","green","blue")):
-#     v2 = np.empty(len(v), dtype=v.dtype.descr + [("red","u1"),("green","u1"),("blue","u1")])
-#     for k in v.dtype.names: v2[k] = v[k]
-# else:
-#     v2 = v.copy()
-# # gray background
-# v2["red"], v2["green"], v2["blue"] = 0, 0, 0
-# # red instance
-# v2["red"][mask], v2["green"][mask], v2["blue"][mask] = 255, 255, 255
-
-# ply2 = PlyData([PlyElement.describe(v2, "vertex")] + [e for e in ply.elements if e.name != "vertex"], text=False)
-# ply2.write("./instance_debug_meshes/test.ply")
-
 avgs = eval_instance_from_two_meshes(
     gt_ply_path, pred_ply_path, mesh_name,
     gt_class_field="class_id",
-    gt_obj_field="object_id",
+    gt_inst_field="object_id",
     pred_class_field="pred_class_id",
-    pred_obj_field="pred_object_id",
-    pred_conf_field="pred_class_conf",
-    conf_default=1.0,
+    pred_inst_field="pred_object_id"
 )
