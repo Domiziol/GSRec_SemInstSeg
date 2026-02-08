@@ -3,22 +3,16 @@ import torch
 
 import numpy as np
 
-import subprocess
-
 from scene import Scene
 import json
-import time
 from gaussian_renderer import render, prefilter_voxel
-import torchvision
 from tqdm import tqdm
 from utils.general_utils import safe_state
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
-import matplotlib.pyplot as plt
-from utils.loss_utils import compute_scale_and_shift
 from utils.mesh_utils import poisson_surface_reconstruction
-from gaussian_renderer import generate_neural_gaussians, generate_neural_gaussians_SDF
+from gaussian_renderer import generate_neural_gaussians_SDF
 
 # for marching cube
 from skimage import measure
@@ -30,8 +24,7 @@ import vdbfusion
 from utils.graphics_utils import depth2point
 
 from sklearn.neighbors import NearestNeighbors
-from scipy.special import softmax
-from scipy.spatial import ckdtree
+
 
 def get_grid_uniform(resolution, grid_boundary=[-2.0, 2.0]):
     x = np.linspace(grid_boundary[0], grid_boundary[1], resolution)
@@ -86,20 +79,6 @@ def get_surface_trace(path, gs, resolution=100, grid_boundary=[-2.0, 2.0], retur
         return traces
     return None
 
-import colorsys
-
-def palette_from_classes(classes, s=0.65, v=0.95):
-    n = max(1, len(classes)+1)
-    table = np.zeros((len(classes)+1, 3), dtype=np.float32)
-    for i, _ in enumerate(classes):
-        h = i / n
-        r, g, b = colorsys.hsv_to_rgb(h, s, v)
-        table[i] = (r, g, b)
-
-    # if np.any(np.asarray(classes) == -1):
-    #     table[102] = (0, 0, 0)
-    return table 
-
 def get_classes():
     classes= []
 
@@ -111,208 +90,69 @@ def get_classes():
 
     return classes
 
-def weighted_logit_mean(
-    anchors_xyz,
-    logits,
-    k=50,
-    self_weight=1.0,
-    use_entropy=True,
-    alpha=0.5):
+def row_softmax(row):
+
+    row = row.astype(np.float64, copy=True)
+
+    row -= row.max(axis=1, keepdims=True)
+
+    np.exp(row, out=row)
+    row /= row.sum(axis=1, keepdims=True)
+
+    return row
+
+def logits_smoothing(anchors_xyz, logits):
 
     N, K = logits.shape
 
-    idx_sorted = np.argsort(logits, axis=1)
-    top1 = logits[np.arange(N), idx_sorted[:, -1]]
-    top2 = logits[np.arange(N), idx_sorted[:, -2]]
+    sortedIds = np.argsort(logits, axis=1)
+    top1 = logits[np.arange(N), sortedIds[:, -1]]
+    top2 = logits[np.arange(N), sortedIds[:, -2]]
     margin = top1 - top2
-    conf_margin = 1.0 / (1.0 + np.exp(-margin / 2.0))
 
-    if use_entropy:
-        z = logits - logits.max(axis=1, keepdims=True)
-        ez = np.exp(z)
-        sum_ez = ez.sum(axis=1, keepdims=True)
-        P = ez / np.clip(sum_ez, 1e-12, None)
-        # H = -sum p*log p
-        H = -(P * np.log(np.clip(P, 1e-12, 1.0))).sum(axis=1)
-        Hmax = np.log(K)
-        conf_entropy = 1.0 - H / (Hmax + 1e-12)
-        
-        conf = alpha * conf_entropy + (1.0 - alpha) * conf_margin
-    else:
-        conf = conf_margin
+    margin = 1.0 / (1.0 + np.exp(-margin / 2.0))    # pewność
+
+    
+    exp = np.exp(logits - logits.max(axis=1, keepdims=True))
+    expSum = exp.sum(axis=1, keepdims=True)
+    prob = exp / np.clip(expSum, 1e-12, None)
+
+    # entropia
+    H = - (prob * np.log(np.clip(prob, 1e-12, 1.0))).sum(axis=1)
+    smoothingFactor = 1.0 - H / (np.log(K) + 1e-12)
+    
+    conf = 0.5 * smoothingFactor + 0.5 * margin
+    
+
+    nn = NearestNeighbors(n_neighbors=min(50, N)).fit(anchors_xyz)
+    d, ids = nn.kneighbors(anchors_xyz, return_distance=True)
+    sigma_s = (np.median( d[d > 0]) if  d[d > 0].size else 1.0) + 1e-9
+
+    weight = np.exp(-(d**2) / (2.0 * sigma_s**2))
+    weight *= conf[ids]
+
+    weightSelf = 1.0 * conf
+    denominator = np.maximum(weightSelf + weight.sum(axis=1), 1e-12)
+    neighbours = (weight[..., None] * logits[ids]).sum(axis=1)
+    self = (weightSelf[:, None] * logits)
+
+    return (self + neighbours) / denominator[:, None]
+
+def mean_logit_smoothing(anchors_xyz,logits,k=30,self_weight=2.0):
+   
+    N = logits.shape[0]
 
     nn = NearestNeighbors(n_neighbors=min(k, N)).fit(anchors_xyz)
-    dists, nbr_idx = nn.kneighbors(anchors_xyz, return_distance=True)
+    _, neighbours = nn.kneighbors(anchors_xyz, return_distance=True)
 
-    nz = dists[dists > 0]
-    sigma_s = (np.median(nz) if nz.size else 1.0) + 1e-9
+    neighLogits = logits[neighbours].sum(axis=1)
 
-    W = np.exp(-(dists**2) / (2.0 * sigma_s**2))
-    W *= conf[nbr_idx]   # neighbor's confidence
-
-    w_self = self_weight * conf
-    denom = np.maximum(w_self + W.sum(axis=1), 1e-12)
-
-    z_neighbors = (W[..., None] * logits[nbr_idx]).sum(axis=1)
-    z_self = (w_self[:, None] * logits)
-
-    z_out = (z_self + z_neighbors) / denom[:, None]
-    return z_out
-
-# def weighted_logit_mean(
-#     anchors_xyz,
-#     logits,
-#     k=50,
-#     self_weight=1.0,
-#     use_entropy=True,
-#     alpha=0.5):
-
-#     N, K = logits.shape
-
-#     idx_sorted = np.argsort(logits, axis=1)
-#     top1 = logits[np.arange(N), idx_sorted[:, -1]]
-#     top2 = logits[np.arange(N), idx_sorted[:, -2]]
-#     margin = top1 - top2
-#     conf_margin = 1.0 / (1.0 + np.exp(-margin / 2.0))
-
-#     if use_entropy:
-#         z = logits - logits.max(axis=1, keepdims=True)
-#         ez = np.exp(z)
-#         sum_ez = ez.sum(axis=1, keepdims=True)
-#         P = ez / np.clip(sum_ez, 1e-12, None)
-#         # H = -sum p*log p
-#         H = -(P * np.log(np.clip(P, 1e-12, 1.0))).sum(axis=1)
-#         Hmax = np.log(K)
-#         conf_entropy = 1.0 - H / (Hmax + 1e-12)
-        
-#         conf = alpha * conf_entropy + (1.0 - alpha) * conf_margin
-#     else:
-#         conf = conf_margin
-
-#     nn = NearestNeighbors(n_neighbors=min(k, N)).fit(anchors_xyz)
-#     dists, nbr_idx = nn.kneighbors(anchors_xyz, return_distance=True)
-
-#     nz = dists[dists > 0]
-#     sigma_s = (np.median(nz) if nz.size else 1.0) + 1e-9
-
-#     W = np.exp(-(dists**2) / (2.0 * sigma_s**2))
-#     W *= conf[nbr_idx]   # neighbor's confidence
-
-#     w_self = self_weight * conf
-#     denom = np.maximum(w_self + W.sum(axis=1), 1e-12)
-
-#     z_neighbors = (W[..., None] * logits[nbr_idx]).sum(axis=1)
-#     z_self = (w_self[:, None] * logits)
-
-#     z_out = (z_self + z_neighbors) / denom[:, None]
-#     return z_out
-
-def row_softmax(Z):
-    Z = Z.astype(np.float64, copy=True)
-    Z -= Z.max(axis=1, keepdims=True)
-    np.exp(Z, out=Z)
-    Z /= Z.sum(axis=1, keepdims=True)
-    return Z
-
-def contrast_palette2(
-    labels,
-    s_range=(0.55, 0.95),
-    v_range=(0.65, 1.0),
-    base_hue=0.13,
-    noise_label=-1,
-):
-    """
-    Create a high-contrast RGB palette for the given labels.
-
-    - labels: 1D array-like of label ids (e.g. DBSCAN labels)
-    - s_range: (min_s, max_s) saturation range
-    - v_range: (min_v, max_v) value/brightness range
-    - base_hue: starting hue in [0, 1]
-    - noise_label: label id to paint as gray (e.g. -1 for DBSCAN)
-    """
-    labels = np.asarray(labels)
-    uniq = np.unique(labels)
-
-    # Separate noise label (if present) so it gets a fixed gray color
-    has_noise = noise_label in uniq
-    if has_noise:
-        class_labels = [l for l in uniq if l != noise_label]
-    else:
-        class_labels = uniq.tolist()
-
-    n_classes = max(1, len(class_labels))
-    phi = 0.6180339887498949  # golden ratio conjugate
-
-    # Pre-allocate output table in *input* label order
-    table = np.zeros((len(labels), 3), dtype=np.float32)
-
-    # Make a mapping: label -> (index in class_labels) so colors are stable
-    label_to_idx = {lab: i for i, lab in enumerate(class_labels)}
-
-    # Small pattern of (s, v) combinations to boost local contrast
-    # neighbors will differ in both hue AND (s, v)
-    sv_patterns = [
-        (s_range[1], v_range[1]),  # bright & saturated
-        (s_range[1], v_range[0]),  # saturated but darker
-        (s_range[0], v_range[1]),  # bright but less saturated
-        (s_range[0], v_range[0]),  # darker and less saturated
-    ]
-
-    # First assign colors for all non-noise labels
-    for idx, lab in enumerate(class_labels):
-        k = label_to_idx[lab]
-
-        # 1) Hue using golden ratio sequence (good global separation)
-        h = (base_hue + k * phi) % 1.0
-
-        # 2) Saturation + value: cycle through sv_patterns for local contrast
-        s, v = sv_patterns[k % len(sv_patterns)]
-
-        r, g, b = colorsys.hsv_to_rgb(h, s, v)
-
-        # Set this color for all entries with label == lab
-        table[labels == lab] = (r, g, b)
-
-    # Now handle noise label as mid-gray (or tweak as you like)
-    if has_noise:
-        gray = np.array([0.5, 0.5, 0.5], dtype=np.float32)
-        table[labels == noise_label] = gray
-
-    if np.any(np.asarray(labels) == -1):
-        table[102] = (0.6, 0.6, 0.6)
-
-    return table
-
-def mean_logit_smoothing(
-    anchors_xyz,
-    logits,
-    k=30,
-    self_weight=2.0,
-):
-    """
-    Simple k-NN logit smoothing by arithmetic mean.
-
-    anchors_xyz : (N, 3)
-    logits      : (N, K)
-    """
-
-    N, K = logits.shape
-
-    # k-NN (including self, as in sklearn)
-    nn = NearestNeighbors(n_neighbors=min(k, N)).fit(anchors_xyz)
-    _, nbr_idx = nn.kneighbors(anchors_xyz, return_distance=True)
-
-    # Sum neighbor logits
-    z_neighbors = logits[nbr_idx].sum(axis=1)  # (N, K)
-
-    # Self contribution
-    z_self = self_weight * logits
+    selfFactor = self_weight * logits
 
     # Normalization
-    denom = self_weight + nbr_idx.shape[1]
+    denominator = self_weight + neighbours.shape[1]
 
-    z_out = (z_self + z_neighbors) / denom
-    return z_out
+    return (selfFactor + neighLogits) / denominator
 
 colors = (
     (242,73,73),(109,127,248),(242,221,73),(73,155,242),(242,142,73),
@@ -352,45 +192,40 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
             # 1
             # anchor_xyz = gaussians.get_anchor.detach().cpu().numpy()
             # logits = gaussians._sem_logits.detach().cpu().numpy()
-            # smoothed_logits = weighted_logit_mean(anchor_xyz, logits)
-            # # Pi = gaussians.get_sem_probs()              # [N_anchor, K], softmaxed
-            # Pi = row_softmax(smoothed_logits)
-            # cls_idx = np.full(Pi.shape[0], -1, int)
-            # mask_conf = Pi.max(axis=1) >= 0.5   # shape (N,)
-            # cls_idx[mask_conf] = Pi[mask_conf].argmax(axis=1)
+            # smoothed_logits = logits_smoothing(anchor_xyz, logits)
+            # probs = row_softmax(smoothed_logits)
+            # cls_idx = np.full(probs.shape[0], -1, int)
+            # mask_conf = probs.max(axis=1) >= 0.5   # shape (N,)
+            # cls_idx[mask_conf] = probs[mask_conf].argmax(axis=1)
 
             # 2
-            # logits = gaussians._sem_logits.detach().cpu().numpy()  # raw
-            # Pi     = softmax(logits, axis=1)
-            # cls_idx = np.full(Pi.shape[0], -1, int)
-            # mask_conf = Pi.max(axis=1) >= 0.5
-            # cls_idx[mask_conf] = Pi[mask_conf].argmax(axis=1)
+            # logits = gaussians._sem_logits.detach().cpu().numpy()
+            # probs= softmax(logits, axis=1)
+            # cls_idx = np.full(probs.shape[0], -1, int)
+            # mask_conf = probs.max(axis=1) >= 0.5
+            # cls_idx[mask_conf] = probs[mask_conf].argmax(axis=1)
 
             # 3
-            # logits = gaussians._sem_logits.detach().cpu().numpy()   # [N,K]
-            # Pi = softmax(logits, axis=1)                            # [N,K]
-            # cls_idx = Pi.argmax(axis=1).astype(int)                 # [N]
+            # logits = gaussians._sem_logits.detach().cpu().numpy() 
+            # probs = softmax(logits, axis=1)
+            # cls_idx = probs.argmax(axis=1).astype(int)
             
             # 4
             logits = gaussians._sem_logits.detach().cpu().numpy()
             anchor_xyz = gaussians.get_anchor.detach().cpu().numpy()
-            # smoothed_logits = weighted_logit_mean(anchor_xyz, logits)
+            # smoothed_logits = logits_smoothing(anchor_xyz, logits)
             smoothed_logits = mean_logit_smoothing(anchor_xyz, logits)
-            Pi = row_softmax(smoothed_logits)
-            cls_idx = Pi.argmax(axis=1).astype(np.int32)
+            probs = row_softmax(smoothed_logits)
+            cls_idx = probs.argmax(axis=1).astype(np.int32)
         
         anchor_xyz = gaussians.get_anchor.detach().cpu().numpy()
-        classes = get_classes()                         # same list used when you constructed GaussianModel
 
-        palette = (np.asarray(colors, dtype=np.float32) / 255.0)  # (101,3) in [0,1]
+        palette = (np.asarray(colors, dtype=np.float32) / 255.0)
 
         cls = cls_idx.copy()
-        cls = np.clip(cls, 0, len(palette) - 1)                   # safety (handles any weird values)
+        cls = np.clip(cls, 0, len(palette) - 1)
 
         anchor_colors = palette[cls]    
-        # palette = contrast_palette2(classes)         # [K,3] floats in [0,1]
-        # anchor_colors = palette[cls_idx] 
-        # anchor_colors = palette[np.clip(cls_idx, 0, palette.shape[0]-1)]
 
         # anchor_colors = np.zeros((anchor_xyz.shape[0], 3), dtype=np.float32)
         # # cls==60 -> white
@@ -425,16 +260,6 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         # mesh.compute_vertex_normals()
 
         from scipy.spatial import cKDTree
-
-        # k = gaussians.n_offsets 
-        # N_anchor = gaussians.get_anchor.shape[0]
-        # anchor_cls_rep = anchor_cls.repeat_interleave(k)
-
-        # kdtree = cKDTree(points)
-        # verts = np.asarray(mesh.vertices)
-        # _, idx = kdtree.query(verts, k=1)
-        # v_colors = gauss_colors[idx]
-        
         kdtree = cKDTree(anchor_xyz)
         verts = np.asarray(mesh.vertices)
         _, idx = kdtree.query(verts, k=1)
@@ -443,7 +268,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
         mesh.vertex_colors = o3d.utility.Vector3dVector(v_colors.astype(np.float64))
         
-        o3d.io.write_triangle_mesh(os.path.join(model_path, "semantic_mesh_poisson_mean_d8l0.1_{}".format(iteration)+ ".ply"), mesh, write_vertex_colors=True)
+        o3d.io.write_triangle_mesh(os.path.join(model_path, "TESTsemantic_mesh_poisson_mean_d8l0.1_{}".format(iteration)+ ".ply"), mesh, write_vertex_colors=True)
       
     elif mesh_type == "mcube":
         _ = get_surface_trace(
@@ -492,52 +317,12 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
             ckpt = torch.load(checkpoint, map_location="cuda")
             if isinstance(ckpt, tuple) and isinstance(ckpt[0], tuple):
                 capture = ckpt[0]
-            else:
-                raise RuntimeError("Unexpected checkpoint format; expected (capture, iteration)")
-
-            # --- OPTION A: directly grab sem logits by index (based on your printout) ---
-            sem_logits = capture[7]   # shape [N_anchor, K_classes] = (98606, 101)
-
-            # Sanity: make sure anchors count matches the scene’s anchors
-            N_ckpt = sem_logits.shape[0]
-            N_scene = gaussians._anchor.shape[0]
-            if N_ckpt != N_scene:
-                print(f"[extract_mesh] Anchor count mismatch: ckpt={N_ckpt} vs scene={N_scene}. "
-                    f"Build Scene with the SAME iteration as the checkpoint or do a full restore.")
-                # Either rebuild Scene with load_iteration=<that iteration>,
-                # or do a full model restore (see Option B below).
-
-            # Attach to the model (no need to train here, so keep it frozen)
-            gaussians._sem_logits = torch.nn.Parameter(
-                sem_logits.to(gaussians._anchor.device), requires_grad=False
-            )
-            # 
-            # print("[ckpt] type:", type(ckpt))
-
-            # if isinstance(ckpt, tuple):
-            #     print("[ckpt] tuple length:", len(ckpt))
-            #     # Training saves usually look like: (capture_tuple, iteration)
-            #     capture = ckpt[0] if len(ckpt) >= 1 else None
-            #     print("[ckpt] capture is tuple?", isinstance(capture, tuple))
-            #     if isinstance(capture, tuple):
-            #         print("[ckpt] capture length:", len(capture))
-            #         for i, it in enumerate(capture):
-            #             if torch.is_tensor(it):
-            #                 print(f"  capture[{i}] tensor shape={tuple(it.shape)} dtype={it.dtype}")
-            #             else:
-            #                 print(f"  capture[{i}] type={type(it)}")
-            # elif isinstance(ckpt, dict):
-            #     print("[ckpt] dict keys:", list(ckpt.keys())[:20])
-            # else:
-            #     print("[ckpt] unexpected object")
-            # (model_params, _) = torch.load(checkpoint)
-            # sem_logits = model_params[8]
-            # if sem_logits is None or sem_logits.numel() == 0:
-            #     print("[extract_mesh] Checkpoint has empty sem logits; continuing without trained semantics.")
-            #     return False
-        gaussians.eval()
-        # gaussians._sem_logits = torch.nn.Parameter(sem_logits.to(gaussians._anchor.device))
-        # gaussians.num_classes = sem_logits.shape[1]
+           
+                sem_logits = capture[7]
+                    
+                gaussians._sem_logits = torch.nn.Parameter(sem_logits.to(gaussians._anchor.device), requires_grad=False)
+            
+                gaussians.eval()
 
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
