@@ -7,22 +7,11 @@ from utils.general_utils import safe_state
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
-from utils.mesh_utils import poisson_surface_reconstruction
-from gaussian_renderer import generate_neural_gaussians_SDF
-from collections import defaultdict
-from itertools import combinations
 import json
-from sklearn.cluster import DBSCAN, Birch, OPTICS
-from sklearn.neighbors import KDTree, NearestNeighbors
-import scipy.special as sp
-from scipy.spatial.distance import jensenshannon, pdist
-from scipy.sparse import csr_matrix
 import open3d as o3d
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
-
+import colorsys
 
 
 def get_classes():
@@ -56,24 +45,12 @@ def setup_gaussian_scene_and_model(dataset : ModelParams, iteration : int, check
             ckpt = torch.load(checkpoint, map_location="cuda")
             if isinstance(ckpt, tuple) and isinstance(ckpt[0], tuple):
                 capture = ckpt[0]
-            else:
-                raise RuntimeError("Unexpected checkpoint format; expected (capture, iteration)")
-
-            # directly grab sem logits by index (based on your printout) ---
+            
             sem_logits = capture[7]
-
-            # make sure anchors count matches the scene’s anchors
-            N_ckpt = sem_logits.shape[0]
-            N_scene = gaussianModel._anchor.shape[0]
-            if N_ckpt != N_scene:
-                print(f"[extract_mesh] Anchor count mismatch: ckpt={N_ckpt} vs scene={N_scene}. "
-                    f"Build Scene with the SAME iteration as the checkpoint or do a full restore.")
                 
-            gaussianModel._sem_logits = torch.nn.Parameter(
-                sem_logits.to(gaussianModel._anchor.device), requires_grad=False
-            )
+            gaussianModel._sem_logits = torch.nn.Parameter(sem_logits.to(gaussianModel._anchor.device), requires_grad=False)
 
-        gaussianModel.eval() # setup values for trained gaussian model
+        gaussianModel.eval()
 
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -82,11 +59,8 @@ def setup_gaussian_scene_and_model(dataset : ModelParams, iteration : int, check
 
     return gaussianModel, scene, anchors, sem_logits
 
-def view_projection(anchors, anchors_id, view): #, gaussianModel, pipeline, background):
-    # render_scene = render(view, gaussianModel, pipeline, background, visible_mask=None, learn_SDF=False)
-    # visible_anchor = render_scene["visible_anchor"].cpu().detach().numpy()
+def single_view_projection(anchors, anchors_id, view):
     camera = view
-
     
     view_matrix = camera.world_view_transform.cpu().numpy()
     view_matrix = view_matrix.T
@@ -94,8 +68,8 @@ def view_projection(anchors, anchors_id, view): #, gaussianModel, pipeline, back
     proj_matrix = proj_matrix.T
     full_proj_transform = proj_matrix @ view_matrix
 
-    points_h = np.concatenate([anchors, np.ones((anchors.shape[0], 1))], axis=1)
-    clip_coords = (full_proj_transform @ points_h.T).T
+    points = np.concatenate([anchors, np.ones((anchors.shape[0], 1))], axis=1)
+    clip_coords = (full_proj_transform @ points.T).T
     w = clip_coords[:, 3]
     ndc = clip_coords[:, :3] / clip_coords[:, 3:4]
     W, H = camera.image_width, camera.image_height
@@ -103,36 +77,20 @@ def view_projection(anchors, anchors_id, view): #, gaussianModel, pipeline, back
     v = np.round((1 + ndc[:, 1]) * 0.5 * H).astype(int)
     mask = np.zeros((H, W), dtype=np.uint8)
 
-    # Keep only points within image bounds and in front of the camera
     valid = (u >= 0) & (u < W) & (v >= 0) & (v < H) & (clip_coords[:, 3] > 0)
-    
 
     u_valid = u[valid]
     v_valid = v[valid]
     visible_ids = anchors_id[valid]
 
-    # projection_info = dict(zip(visible_ids, zip(v_valid, u_valid)))
     mask[v_valid, u_valid] = 255
-
-    # projected_anchors = {}
-    # projected_anchors["points"] = [v_valid, u_valid]
-    # projected_anchors["global_id"] = visible_ids
-
-    # print("valid = ", valid.shape[0])
-
-    # plt.imshow(mask, cmap='gray')
-    # plt.title("Visible Anchor Projection")
-    # plt.axis('off')
-    # plt.show()
 
     return visible_ids, v_valid, u_valid
 
 
 def get_original_image(camera):
-    org_image_np = camera.original_image.permute(1,2,0).cpu().numpy()
-    return (org_image_np*255).clip(0, 255).astype(np.uint8)
-
-
+    org_image = camera.original_image.permute(1,2,0).cpu().numpy()
+    return (org_image*255).clip(0, 255).astype(np.uint8)
 
 def get_views(scene, skip_train, skip_test):
     scene_cameras_train = scene.getTrainCameras() if not skip_train else []
@@ -142,89 +100,41 @@ def get_views(scene, skip_train, skip_test):
     return views
 
 
-import colorsys
-def palette_from_labels(labels, s=0.65, v=0.95):
-    l = len(labels)
-    n = max(1, l)
-    table = np.zeros((l, 3), dtype=np.float32)
-    for i in range(l):
-        h = i / n
-        r, g, b = colorsys.hsv_to_rgb(h, s, v)
-        table[i] = (r, g, b)
-    return table
-
-def contrast_palette(labels, s=0.85, v=0.98, noise_gray=0.00):
-    """
-    Drop-in replacement: returns an (L,3) RGB table in [0,1],
-    with well-separated hues. If -1 is among `labels`, the first
-    entry (index 0 after np.unique) is set to gray for noise.
-    """
-    l = len(labels)
-    n = max(1, l)
-    table = np.zeros((l, 3), dtype=np.float32)
-
-    phi = 0.6180339887498949  # golden ratio conjugate
-    h0 = 0.13                 # start hue (tweak if you want)
-
-    for i in range(l):
-        h = (h0 + i * phi) % 1.0
-        # tiny value jitter every few colors to boost contrast
-        vv = v if (i % 3) else min(1.0, v * 0.92)
-        r, g, b = colorsys.hsv_to_rgb(h, s, vv)
-        table[i] = (r, g, b)
-
-    # If labels contain -1, np.unique(labels) puts it at index 0.
-    # Color that entry gray so noise is subdued.
-    if np.any(np.asarray(labels) == -1):
-        table[0] = (noise_gray, noise_gray, noise_gray)
-
-    return table
-
-def generate_sam_data_for_anchors(anchor_points, all_views, files_path, anchor_ids = None):
+def project_anchors_to_2Dsegments(anchor_points, all_views, files_path, anchorIds = None):
     N = anchor_points.shape[0]
     V = len(all_views)
 
-    if anchor_ids is None:
-        anchor_ids = np.arange(anchor_points.shape[0])
+    if anchorIds is None:
+        anchorIds = np.arange(anchor_points.shape[0])
 
     projection_data = np.full((N, V), -1, dtype = np.int32)
 
-    for v_id, view in enumerate(all_views):
-        visible_ids, v, u = view_projection(anchor_points, anchor_ids, view)
+    for view_id, view in enumerate(all_views):
+        visibleIds, v, u = single_view_projection(anchor_points, anchorIds, view)
 
-        if visible_ids.size == 0:
+        if visibleIds.size == 0:
             continue
 
         image_name = view.image_name
         base = os.path.splitext(image_name)[0]
-        npz_path = os.path.join(files_path, f"{base}.npz")
+        file = os.path.join(files_path, f"{base}.npz")
 
-        if os.path.isfile(npz_path):
-            npz = np.load(npz_path)
-            masks = npz["masks"].astype(bool)
+        if os.path.isfile(file):
+            masks = np.load(file)["masks"].astype(bool)
 
             M, H, W = masks.shape
 
-            local = np.full((H,W), -1, dtype=np.int32)
+            view_data = np.full((H,W), -1, dtype=np.int32)
 
             for mask_id in range(M):
-                local[masks[mask_id]] = mask_id
+                view_data[masks[mask_id]] = mask_id
             
-            local_mask_id = local[v,u]
-            positive = local_mask_id != -1
-            projection_data[visible_ids[positive], v_id] = local_mask_id[positive]
+            localMaskId = view_data[v,u]
+            isInSegment = localMaskId != -1
+            projection_data[visibleIds[isInSegment], view_id] = localMaskId[isInSegment]
 
     return projection_data
 
-# def signed_margin_loss(e, i_idx, j_idx, t, m=1.0, alpha=10.0, eps=1e-8):
-#     diff = e[i_idx] - e[j_idx]                 # (P, D)
-#     d = (diff.square().sum(dim=-1) + eps).sqrt()  # (P,)
-#     logits = -alpha * t * (d - m)
-#     return torch.nn.functional.softplus(logits).mean()
-
-# def get_embeddings(indices: torch.Tensor):
-#     e = emb_table(indices)
-#     return F.normalize(e, p=2, dim=-1)
 
 if __name__ == "__main__":
     # Set up command line argument parser with default parameters
@@ -240,8 +150,6 @@ if __name__ == "__main__":
 
     files_path = "./data/replica/scan1/2Dclassification_tests/test1/results/"
 
-
-    # Initialize system state (RNG) -- what is that ????
     safe_state(args.quiet)
 
     gaussianModel, scene, anchor_points, sem_logits = setup_gaussian_scene_and_model(
@@ -249,11 +157,6 @@ if __name__ == "__main__":
         args.iteration,
         args.checkpoint_path
         )
-    logits = sem_logits.cpu().detach().numpy()
-    anchor_id = np.arange(anchor_points.shape[0])
-
-    bg_color = [1,1,1] if model._white_background else [0, 0, 0]
-    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
     all_views = get_views(scene, skip_train=args.skip_train, skip_test = args.skip_test)
     
@@ -262,8 +165,6 @@ if __name__ == "__main__":
     bg_color = [1,1,1] if model._white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-
-    # projection_data = generate_sam_data_for_anchors(anchor_points, all_views, files_path, anchor_id)
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(anchor_points)
@@ -278,23 +179,22 @@ if __name__ == "__main__":
     print(" After: ", len(newpcd2.points))
 
     anchors_downsampled = np.asarray(newpcd2.points)
-    steps = 500
+    steps = 200
 
-    # === Training part === 
+   
     anchors_downsampled_id = np.arange(anchors_downsampled.shape[0])
-    projection_data = generate_sam_data_for_anchors(anchors_downsampled, all_views, files_path, anchors_downsampled_id)
+    projection_data = project_anchors_to_2Dsegments(anchors_downsampled, all_views, files_path, anchors_downsampled_id)
+
 
     loss_history = []
-
-    
-    proj = torch.from_numpy(projection_data).long()
-    N, V = proj.shape
+    projection = torch.from_numpy(projection_data).long()
+    N, V = projection.shape
 
     views_pairs = []
     views_point_matches = []
     for v in range(V):
-        labels_v = proj[:, v]
-        # convert to: 0 = not present, 1.. = local mask id+1
+        labels_v = projection[:, v]
+        # dodaj +1: local mask id+1
         view_segment = torch.where(labels_v == -1, torch.zeros_like(labels_v), labels_v + 1)
 
         view_points = torch.nonzero(view_segment, as_tuple=False).squeeze(1)   # indices visible in this view
