@@ -87,18 +87,6 @@ def saveRuntimeCode(dst: str) -> None:
     
     print('Backup Finished!')
 
-def expand_indices(index_tensor, num_indices):
-    # Create a tensor [0, 1, 2, 3, 4]
-    sequence = torch.arange(num_indices, device=index_tensor.device)
-
-    # Multiply index_tensor by 5 and reshape to (-1, 1) for broadcasting
-    expanded = num_indices * index_tensor.unsqueeze(-1)
-
-    # Add the sequence to each element and reshape
-    result = (expanded + sequence).view(-1)
-
-    return result
-
 def get_classes():
     classes= []
 
@@ -109,25 +97,17 @@ def get_classes():
         classes.append(objects['name'])
 
     return classes
-
-def score_to_weight(scores, lo=0.20, hi=0.35, w_min=0.10):
-    w = (scores - lo) / max(1e-6, (hi - lo))
-    w = torch.clamp(w, 0.0, 1.0)
-    return torch.clamp(w, w_min, 1.0)
     
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None, vis=False, k_near=50, sampling_numbers=8192, learn_sdf=False):
     
     # semantic
     classes = get_classes()
-    class_to_idx = {n:i for i,n in enumerate(classes)}
     if not hasattr(opt, "lambda_sem"):
         opt.lambda_sem = 0.0
     K = len(classes)
-    all_class_idx = list(range(K))
+    classIds = list(range(K))
 
-    SEM_DELAY  = 3000    # keep semantics off while geometry forms
-    # SEM_DELAY  = 0 
-    # SEM_WARMUP = 6000    # linearly ramp over 
+    SEM_DELAY  = 8000
     SEM_TARGET = 0.1
 
     first_iter = 0
@@ -152,14 +132,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     for iteration in range(first_iter, opt.iterations + 1):      
 
         if iteration <= SEM_DELAY:
-            lambda_sem_now = 0.0
-        # elif iteration <= SEM_DELAY + SEM_WARMUP:
-        #     alpha = (iteration - SEM_DELAY) / float(SEM_WARMUP)
-        #     lambda_sem_now = SEM_TARGET * alpha
+            lambda_sem = 0.0
         else:
-            lambda_sem_now = SEM_TARGET
+            lambda_sem = SEM_TARGET
 
-        opt.lambda_sem = lambda_sem_now
+        opt.lambda_sem = lambda_sem
         # if network_gui.conn == None:
         #     network_gui.try_connect()
         # while network_gui.conn != None:
@@ -188,14 +165,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
-        # Load masks for image (SAM+CLIP)
-        samclip_path = "./data/replica/scan1/2Dclassification_tests/test1/results/"
-        # samclip_path = "./data/kitchen_static/masks_test3/"
+        
+        samResultsPath = "./data/replica/scan1/2Dclassification_tests/test1/results/"
         image_name = viewpoint_cam.image_name
         base = os.path.splitext(image_name)[0]
-        npz_path = os.path.join(samclip_path, f"{base}.npz")
-        # print(npz_path)
-        # semantic
+        npz_path = os.path.join(samResultsPath, f"{base}.npz")
         
         # Render
         if (iteration - 1) == debug_from:
@@ -206,15 +180,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         if os.path.isfile(npz_path):
             npz = np.load(npz_path)
-            masks_np = npz["masks"]
-            labels_np = npz["labels"]
-            # scores_np = npz["scores"]
-            if labels_np.size > 0:
+            masks = npz["masks"]
+            labels = npz["labels"]
+            if labels.size > 0:
                 # classes_subset = np.unique(labels_np).tolist()
-                classes_subset = all_class_idx
-                
-            #     #per-view:
-            #     classes_subset = all_class_idx
+                classes_subset = classIds
             # else:
             #     classes_subset = None  
 
@@ -226,64 +196,33 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         render_depth, render_normal, render_median_depth = render_pkg["render_depth"], render_pkg["render_normal"], render_pkg["render_median_depth"]
 
         # semantic loss (cross entropy)
-        p_sem = render_pkg["semantics"] # semantic
+        probs_sem = render_pkg["semantics"]
         sem_loss = torch.tensor(0.0, device=image.device)
 
         if os.path.isfile(npz_path):
-            # npz = np.load(npz_path)
-            # masks_np = npz["masks"]
-            # labels_np = npz["labels"]
-
-
-
-            if opt.lambda_sem > 0.0 and (p_sem is not None):
-                if masks_np.size > 0 and labels_np.size > 0:
-                    _, K, H, W = p_sem.shape
-                    M = masks_np.shape[0]
-                    masks_bool_t = torch.from_numpy(masks_np).to(torch.bool).to(image.device)  # [M,H,W]
-                    labels_t   = torch.from_numpy(labels_np).to(torch.long).to(image.device)
-                    # scores_t = torch.from_numpy(scores_np).to(torch.float32).to(image.device)
+            
+            if opt.lambda_sem > 0.0 and (probs_sem is not None):
+                if masks.size > 0 and labels.size > 0:
+                    _, K, H, W = probs_sem.shape
+                    M = masks.shape[0]
+                    masksBoolTensor = torch.from_numpy(masks).to(torch.bool).to(image.device)
+                    labelsTensor= torch.from_numpy(labels).to(torch.long).to(image.device)
 
                     IGNORE = 255
                     target_image = torch.full((H,W), IGNORE, dtype = torch.long, device = image.device)
 
-                    for idx in range(M):
-                        mask = masks_bool_t[idx]
-                        class_id = int(labels_t[idx].item())
-                        if 0 <= class_id < K:
-                            target_image[mask] = class_id
+                    for i in range(M):
+                        mask = masksBoolTensor[i]
+                        labelId = int(labelsTensor[i].item())
+                        if 0 <= labelId < K:
+                            target_image[mask] = labelId
 
-                    # weight_masks = score_to_weight(scores_t)
-                    # weight_map = torch.ones((H,W), device=image.device, dtype=torch.float32)
-
-                    # for j in range(M):
-                    #     c = int(labels_t[j].item())
-                    #     if 0 <= c < K:
-                    #         weight_map[masks_bool_t[j]] = weight_masks[j]
+                    log_p = torch.log(probs_sem.clamp_min(1e-6))
+                    target = target_image.unsqueeze(0)
                     
-                    # log_p = torch.log(p_sem.clamp_min(1e-6))[0]     # [K,H,W]
-                    
-                    log_p = torch.log(p_sem.clamp_min(1e-6))          # [1, K, H, W]
-
-                    # target_image: [H, W] with ints in [0..K-1] or IGNORE
-                    target_batched = target_image.unsqueeze(0)
-                    
-                    # ce = F.nll_loss(                          
-                    #     input=log_p,
-                    #     target=target_batched,
-                    #     ignore_index=IGNORE,
-                    #     reduction="none"
-                    # )
-
-                    # valid = (target_image != IGNORE).unsqueeze(0).float()      # [1,H,W]
-                    # num   = (ce * weight_map.unsqueeze(0) * valid).sum()
-                    # den   = (weight_map.unsqueeze(0) * valid).sum().clamp_min(1.0)
-                    # sem_loss = num / den
-
-
-                    sem_loss = F.nll_loss(                          # single fused op, fast
-                        input=log_p,                                # [K,H,W]
-                        target=target_batched,                           # [K, H,W]
+                    sem_loss = F.nll_loss(
+                        input=log_p,
+                        target=target,
                         ignore_index=IGNORE,
                         reduction="mean"
                     )
@@ -425,7 +364,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             and (torch.is_tensor(sem_loss))
             and (sem_loss.requires_grad)
             and (sem_loss.detach().item() > 0)
-            and (lambda_sem_now > 0)
+            and (lambda_sem > 0)
         )
 
         loss.backward()
