@@ -185,14 +185,14 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         points, color, opaicity,scaling,rot, normal, _, _, _,anchor_from_gaussian = generate_neural_gaussians_SDF(views[0], gaussians, visible_mask=None)
         with torch.no_grad():
             print("anchor:", gaussians.get_anchor.shape)
-            if hasattr(gaussians, "_sem_logits") and gaussians._sem_logits is not None:
-                print("sem_logits shape:", gaussians._sem_logits.shape)
+            if hasattr(gaussians, "sem_logits") and gaussians.sem_logits is not None:
+                print("sem_logits shape:", gaussians.sem_logits.shape)
             else:
-                print("_sem_logits is None")
+                print("sem_logits is None")
             
             # 1
             # anchor_xyz = gaussians.get_anchor.detach().cpu().numpy()
-            # logits = gaussians._sem_logits.detach().cpu().numpy()
+            # logits = gaussians.sem_logits.detach().cpu().numpy()
             # smoothed_logits = logits_smoothing(anchor_xyz, logits)
             # probs = row_softmax(smoothed_logits)
             # cls_idx = np.full(probs.shape[0], -1, int)
@@ -200,19 +200,19 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
             # cls_idx[mask_conf] = probs[mask_conf].argmax(axis=1)
 
             # 2
-            # logits = gaussians._sem_logits.detach().cpu().numpy()
+            # logits = gaussians.sem_logits.detach().cpu().numpy()
             # probs= softmax(logits, axis=1)
             # cls_idx = np.full(probs.shape[0], -1, int)
             # mask_conf = probs.max(axis=1) >= 0.5
             # cls_idx[mask_conf] = probs[mask_conf].argmax(axis=1)
 
             # 3
-            # logits = gaussians._sem_logits.detach().cpu().numpy() 
+            # logits = gaussians.sem_logits.detach().cpu().numpy() 
             # probs = softmax(logits, axis=1)
             # cls_idx = probs.argmax(axis=1).astype(int)
             
             # 4
-            logits = gaussians._sem_logits.detach().cpu().numpy()
+            logits = gaussians.sem_logits.detach().cpu().numpy()
             anchor_xyz = gaussians.get_anchor.detach().cpu().numpy()
             # smoothed_logits = logits_smoothing(anchor_xyz, logits)
             smoothed_logits = mean_logit_smoothing(anchor_xyz, logits)
@@ -321,7 +321,7 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
            
                 sem_logits = capture[7]
                     
-                gaussians._sem_logits = torch.nn.Parameter(sem_logits.to(gaussians._anchor.device), requires_grad=False)
+                gaussians.sem_logits = torch.nn.Parameter(sem_logits.to(gaussians._anchor.device), requires_grad=False)
             
                 gaussians.eval()
 

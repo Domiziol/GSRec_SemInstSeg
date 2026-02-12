@@ -56,7 +56,7 @@ def setup_gaussian_scene_and_model(dataset : ModelParams, iteration : int, check
             
             sem_logits = capture[7]
                 
-            gaussianModel._sem_logits = torch.nn.Parameter(sem_logits.to(gaussianModel._anchor.device), requires_grad=False)
+            gaussianModel.sem_logits = torch.nn.Parameter(sem_logits.to(gaussianModel._anchor.device), requires_grad=False)
 
         gaussianModel.eval()
 
@@ -343,12 +343,12 @@ if __name__ == "__main__":
 
     N, V = anchor_points.shape
     
-    w_dist = 0.2
-    w_emb = 0.6
-    w_sem = 0.2
+    w_dist = 0.5
+    w_emb = 0.2
+    w_sem = 0.3
 
     min_samples = 20
-    eps = 0.6
+    eps = 0.35
     k_neighbours = 512
 
     

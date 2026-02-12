@@ -51,7 +51,7 @@ def setup_gaussian_scene_and_model(dataset : ModelParams, iteration : int, check
             
             sem_logits = capture[7]
                 
-            gaussianModel._sem_logits = torch.nn.Parameter(sem_logits.to(gaussianModel._anchor.device), requires_grad=False)
+            gaussianModel.sem_logits = torch.nn.Parameter(sem_logits.to(gaussianModel._anchor.device), requires_grad=False)
 
         gaussianModel.eval()
 

@@ -385,7 +385,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         loss.backward()
 
         if should_expect_sem_grad:
-            assert gaussians._sem_logits.grad is not None
+            assert gaussians.sem_logits.grad is not None
 
         
         iter_end.record()
