@@ -33,7 +33,7 @@ def get_classes():
 
     return classes
 
-def setup_gaussian_scene_and_model(dataset : ModelParams, iteration : int, checkpoint: str):
+def setup_gaussian_scene_and_model(dataset, iteration, checkpoint):
     classes = get_classes()
 
     with torch.no_grad():
@@ -267,13 +267,13 @@ def build_precomputed(anchor_points, embeddings, eps, logits, w_dist, w_emb, w_s
             
     
         D_xyz = (d_xyz / (s_xyz + 1e-12))
-        D_xyz = D_xyz / (1.0 + D_xyz)
+        # D_xyz = D_xyz / (1.0 + D_xyz)
 
         D_emb = (d_emb / (s_emb + 1e-12))
-        D_emb = D_emb / (1.0 + D_emb)
+        # D_emb = D_emb / (1.0 + D_emb)
 
         D_sem = (d_sem / (s_sem + 1e-12))
-        D_sem = D_sem / (1.0 + D_sem)
+        # D_sem = D_sem / (1.0 + D_sem)
 
 
         d = D_emb * w_emb + D_xyz * w_dist + w_sem * D_sem

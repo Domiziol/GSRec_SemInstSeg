@@ -10,7 +10,7 @@ from ultralytics.models.sam import SAM3SemanticPredictor
 
 import re
 
-def class_name(s: str) -> str:
+def class_name(s):
     s = s.strip().replace(" ", "_")
     s = re.sub(r"[^a-zA-Z0-9_\-]+", "", s)
     return s[:80] if len(s) > 80 else s

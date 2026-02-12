@@ -211,33 +211,31 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         probs_sem = render_pkg["semantics"]
         sem_loss = torch.tensor(0.0, device=image.device)
 
-        if os.path.isfile(npz_path):
+        if os.path.isfile(npz_path) and opt.lambda_sem > 0.0 and (probs_sem is not None) and  masks.size > 0 and labels.size > 0:
             
-            if opt.lambda_sem > 0.0 and (probs_sem is not None):
-                if masks.size > 0 and labels.size > 0:
-                    _, K, H, W = probs_sem.shape
-                    M = masks.shape[0]
-                    masksBoolTensor = torch.from_numpy(masks).to(torch.bool).to(image.device)
-                    labelsTensor= torch.from_numpy(labels).to(torch.long).to(image.device)
+            _, K, H, W = probs_sem.shape
+            M = masks.shape[0]
+            masksBoolTensor = torch.from_numpy(masks).to(torch.bool).to(image.device)
+            labelsTensor= torch.from_numpy(labels).to(torch.long).to(image.device)
 
-                    IGNORE = 255
-                    target_image = torch.full((H,W), IGNORE, dtype = torch.long, device = image.device)
+            IGNORE = 255
+            target_image = torch.full((H,W), IGNORE, dtype = torch.long, device = image.device)
 
-                    for i in range(M):
-                        mask = masksBoolTensor[i]
-                        labelId = int(labelsTensor[i].item())
-                        if 0 <= labelId < K:
-                            target_image[mask] = labelId
+            for i in range(M):
+                mask = masksBoolTensor[i]
+                labelId = int(labelsTensor[i].item())
+                if 0 <= labelId < K:
+                    target_image[mask] = labelId
 
-                    log_p = torch.log(probs_sem.clamp_min(1e-6))
-                    target = target_image.unsqueeze(0)
-                    
-                    sem_loss = F.nll_loss(
-                        input=log_p,
-                        target=target,
-                        ignore_index=IGNORE,
-                        reduction="mean"
-                    )
+            log_p = torch.log(probs_sem.clamp_min(1e-6))
+            target = target_image.unsqueeze(0)
+            
+            sem_loss = F.nll_loss(
+                input=log_p,
+                target=target,
+                ignore_index=IGNORE,
+                reduction="mean"
+            )
         # ====
 
         # monocular depth loss

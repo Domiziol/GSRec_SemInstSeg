@@ -28,7 +28,7 @@ def get_classes():
 
     return classes
 
-def setup_gaussian_scene_and_model(dataset : ModelParams, iteration : int, checkpoint: str):
+def setup_gaussian_scene_and_model(dataset, iteration, checkpoint):
     classes = get_classes()
 
     with torch.no_grad():
@@ -221,8 +221,8 @@ if __name__ == "__main__":
     for step in range(steps):
         losses = []
         for view_pairs, view_point_matches in zip(views_pairs, views_point_matches):
-            view_embedding_pairs = nn.functional.normalize(embeddings(view_pairs), dim=2) # and this is what?
-            view_embedding_sqdists = (view_embedding_pairs[:,0,:] - view_embedding_pairs[:,1,:]).square().sum(dim=1) # what are those indexes :,0,:?
+            view_embedding_pairs = nn.functional.normalize(embeddings(view_pairs), dim=2)
+            view_embedding_sqdists = (view_embedding_pairs[:,0,:] - view_embedding_pairs[:,1,:]).square().sum(dim=1)
             loss = torch.dot(view_point_matches, view_embedding_sqdists)
             losses.append(loss)        
             #print(torch.cat((view_pairs, torch.unsqueeze(view_point_matches,1)),1))

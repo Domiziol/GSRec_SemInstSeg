@@ -406,7 +406,6 @@ class GaussianModel:
         self.training_setup(training_args)
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
-        self._ensure_sem_logits()
 
     @property
     def get_scaling(self):
