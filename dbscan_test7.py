@@ -132,43 +132,22 @@ def apply_transform_to_mesh(points):
     outPts = (transform @ newPts2.T).T[:, :3]
     return outPts
 
+def mean_logits_smoothing(anchors_xyz, logits):
 
-def logits_smoothing(anchors_xyz, logits):
+    k=30,
+    weightSelf=2.0,
+    N = logits.shape[0]
 
-    N, K = logits.shape
-
-    sortedIds = np.argsort(logits, axis=1)
-    top1 = logits[np.arange(N), sortedIds[:, -1]]
-    top2 = logits[np.arange(N), sortedIds[:, -2]]
-    margin = top1 - top2
-
-    margin = 1.0 / (1.0 + np.exp(-margin / 2.0))    # pewność
-
-    
-    exp = np.exp(logits - logits.max(axis=1, keepdims=True))
-    expSum = exp.sum(axis=1, keepdims=True)
-    prob = exp / np.clip(expSum, 1e-12, None)
-
-    # entropia
-    H = - (prob * np.log(np.clip(prob, 1e-12, 1.0))).sum(axis=1)
-    smoothingFactor = 1.0 - H / (np.log(K) + 1e-12)
-    
-    conf = 0.5 * smoothingFactor + 0.5 * margin
-    
-
-    nn = NearestNeighbors(n_neighbors=min(50, N)).fit(anchors_xyz)
+    nn = NearestNeighbors(n_neighbors=min(k, N)).fit(anchors_xyz)
     d, ids = nn.kneighbors(anchors_xyz, return_distance=True)
-    sigma_s = (np.median( d[d > 0]) if  d[d > 0].size else 1.0) + 1e-9
 
-    weight = np.exp(-(d**2) / (2.0 * sigma_s**2))
-    weight *= conf[ids]
+    neighSum = logits[ids].sum(axis=1)
+    self = weightSelf * logits
+    # Normalization
+    denominator = weightSelf + ids.shape[1]
 
-    weightSelf = 1.0 * conf
-    denominator = np.maximum(weightSelf + weight.sum(axis=1), 1e-12)
-    neighbours = (weight[..., None] * logits[ids]).sum(axis=1)
-    self = (weightSelf[:, None] * logits)
+    return (self + neighSum) / denominator
 
-    return (self + neighbours) / denominator[:, None]
 
 def row_softmax(row):
 
@@ -207,7 +186,7 @@ def get_scales(anchor_points, embeddings, logits,k_candidates, sample_size):
     D_emb = []
     D_sem = []
 
-    smoothed_logits = logits_smoothing(anchor_points, logits)
+    smoothed_logits = mean_logits_smoothing(anchor_points, logits)
     probs = row_softmax(smoothed_logits)
 
     for row_idx, i in enumerate(samples):
@@ -241,7 +220,7 @@ def build_precomputed(anchor_points, embeddings, eps, logits, w_dist, w_emb, w_s
     rows, cols, data = [], [], []
 
     s_xyz, s_emb, s_sem = get_scales(anchor_points, embeddings, logits, 512, 10000)
-    smoothed_logits = logits_smoothing(anchor_points,logits)
+    smoothed_logits = mean_logits_smoothing(anchor_points,logits)
 
     nn = NearestNeighbors(
         n_neighbors=min(k_candidates + 1, N),
@@ -267,13 +246,13 @@ def build_precomputed(anchor_points, embeddings, eps, logits, w_dist, w_emb, w_s
             
     
         D_xyz = (d_xyz / (s_xyz + 1e-12))
-        # D_xyz = D_xyz / (1.0 + D_xyz)
+        D_xyz = D_xyz / (1.0 + D_xyz)
 
         D_emb = (d_emb / (s_emb + 1e-12))
-        # D_emb = D_emb / (1.0 + D_emb)
+        D_emb = D_emb / (1.0 + D_emb)
 
         D_sem = (d_sem / (s_sem + 1e-12))
-        # D_sem = D_sem / (1.0 + D_sem)
+        D_sem = D_sem / (1.0 + D_sem)
 
 
         d = D_emb * w_emb + D_xyz * w_dist + w_sem * D_sem
@@ -387,7 +366,7 @@ if __name__ == "__main__":
     print(f"{n_clusters=}, {n_noise=}")
 
 
-    smoothed_logits = logits_smoothing(anchor_points,logits)
+    smoothed_logits = mean_logits_smoothing(anchor_points,logits)
 
 
     points, color, opaicity,scaling,rot, normal, _, _, _,_ = generate_neural_gaussians_SDF(all_views[0], gaussianModel, visible_mask=None)

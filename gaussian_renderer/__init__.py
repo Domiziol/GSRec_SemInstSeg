@@ -340,7 +340,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         # Repeat anchors so their number matches Gaussians (flattened offsets)
         anchorsVisibleInMaskRepeated = anchorsVisibleInMask.repeat_interleave(pc.n_offsets)
 
-        # Select only the active offsets that produced xyz/color...
+        # Select only gaussians visible in the image
         gaussesMasked = mask.view(-1)
         anchorsFromActiveGausses = anchorsVisibleInMaskRepeated[gaussesMasked]
 
